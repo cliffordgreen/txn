@@ -260,11 +260,17 @@ def run_with_synthetic_data():
     
     # Check specific company-related columns
     print("Checking company-related columns in the data:")
+    company_columns = [col for col in transactions_df.columns 
+                     if any(keyword in col.lower() for keyword in 
+                           ['company', 'industry', 'qbo', 'qblive', 'region'])]
+    
     for col in ['company_id', 'company_name', 'industry_name', 'qbo_current_product']:
         if col in transactions_df.columns:
             print(f"Column '{col}' found with example: {transactions_df[col].iloc[0]}")
         else:
             print(f"Column '{col}' NOT found")
+            
+    print(f"Found company-related columns: {', '.join(company_columns[:8])}")
     
     # Prepare data - this builds the graph and processes features
     data_tuple = classifier.prepare_data(transactions_df)

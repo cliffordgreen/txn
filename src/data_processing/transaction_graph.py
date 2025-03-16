@@ -58,9 +58,11 @@ class TransactionGraphBuilder:
         # Handle missing values
         for col in df.columns:
             if df[col].dtype == 'object':
-                df[col].fillna('unknown', inplace=True)
+                # Fix pandas warning about chained assignment with inplace=True
+                df[col] = df[col].fillna('unknown')
             else:
-                df[col].fillna(df[col].median(), inplace=True)
+                # Fix pandas warning about chained assignment with inplace=True
+                df[col] = df[col].fillna(df[col].median())
         
         # Add merchant_id if not present (use txn_id as fallback)
         if 'merchant_id' not in df.columns:

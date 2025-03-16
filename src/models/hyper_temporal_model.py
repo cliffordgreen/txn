@@ -980,13 +980,24 @@ class HyperTemporalTransactionModel(nn.Module):
                 if company_features.size(1) != self.company_input_dim:
                     # Handle dimension mismatch - project to correct dimension first
                     print(f"WARNING: Company feature dimension mismatch. Got {company_features.size(1)}, expected {self.company_input_dim}")
-                    if not hasattr(self, 'company_dim_adapter'):
+                    # Create an adapter dynamically with the correct dimensions
+                    adapter_name = f"company_dim_adapter_{company_features.size(1)}"
+                    if not hasattr(self, adapter_name):
                         # Create adapter layer on the fly if needed
-                        self.company_dim_adapter = nn.Linear(
-                            company_features.size(1), self.company_input_dim
-                        ).to(company_features.device)
+                        # If dimensions are large, use a more efficient approach with two layers
+                        if company_features.size(1) > 1000:
+                            setattr(self, adapter_name, nn.Sequential(
+                                nn.Linear(company_features.size(1), min(512, company_features.size(1) // 10)),
+                                nn.ReLU(),
+                                nn.Linear(min(512, company_features.size(1) // 10), self.company_input_dim)
+                            ).to(company_features.device))
+                        else:
+                            setattr(self, adapter_name, nn.Linear(
+                                company_features.size(1), self.company_input_dim
+                            ).to(company_features.device))
                     # Apply dimension adapter
-                    company_features = self.company_dim_adapter(company_features)
+                    adapter = getattr(self, adapter_name)
+                    company_features = adapter(company_features)
                 
                 # Now apply the main projection
                 company_h = self.company_projection(company_features)

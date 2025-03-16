@@ -42,10 +42,7 @@ def load_transaction_feedback_data(file_path: str) -> pd.DataFrame:
     # Check if required columns exist
     required_cols = ['user_id', 'txn_id', 'is_new_user']
     target_cols = [
-        'presented_category_id', 'presented_category_name', 
-        'presented_tax_account_type', 'presented_tax_account_type_name', 
-        'accepted_category_id', 'accepted_category_name',
-        'accepted_tax_account_type', 'accepted_tax_account_type_name'
+        'category_name', 'presented_category_name'
     ]
     
     # Business metadata columns (optional)
@@ -236,7 +233,31 @@ class TransactionFeedbackClassifier:
         Returns:
             Tuple of processed data
         """
-        # Initialize graph builder
+        # Ensure we have the necessary target columns
+        required_columns = ['category_name', 'presented_category_name']
+        missing_columns = [col for col in required_columns if col not in transactions_df.columns]
+        if missing_columns:
+            raise ValueError(f"Missing required columns: {missing_columns}")
+        
+        # Map category names to indices for both ground truth and presented categories
+        # Get unique categories from both columns
+        all_categories = sorted(set(transactions_df['category_name'].dropna().unique()) | 
+                               set(transactions_df['presented_category_name'].dropna().unique()))
+        
+        # Create mapping
+        category_mapping = {cat: idx for idx, cat in enumerate(all_categories)}
+        
+        # Add category indices to DataFrame
+        transactions_df = transactions_df.copy()
+        transactions_df['category_idx'] = transactions_df['category_name'].map(category_mapping).fillna(0).astype(int)
+        transactions_df['presented_category_idx'] = transactions_df['presented_category_name'].map(category_mapping).fillna(0).astype(int)
+        
+        # Use 'unknown' for tax type if not available (simplified model)
+        if 'tax_account_type' not in transactions_df.columns:
+            transactions_df['tax_account_type'] = 'unknown'
+        
+        # Initialize graph builder with updated category dim based on actual data
+        self.category_dim = len(category_mapping)
         self.graph_builder = TransactionGraphBuilder(
             num_categories=self.category_dim,
             num_tax_types=self.tax_type_dim
@@ -244,6 +265,10 @@ class TransactionFeedbackClassifier:
         
         # Build graph from transaction data
         self.graph = self.graph_builder.build_graph(transactions_df)
+        
+        # Store the category mapping in the graph for reference
+        self.graph.category_mapping = category_mapping
+        self.graph.category_reverse_mapping = {idx: cat for cat, idx in category_mapping.items()}
         
         # Split graph into train/val/test sets
         self.graph = create_train_val_test_split(self.graph, group_by_user=True)
@@ -296,6 +321,12 @@ class TransactionFeedbackClassifier:
         timestamps = torch.zeros(batch_size, seq_len)
         for i in range(seq_len):
             timestamps[:, i] = i  # Simple sequential timestamps
+            
+        # Store presented category as additional tensor in graph for evaluation
+        if 'presented_category_idx' in transactions_df.columns:
+            self.graph['transaction'].y_presented_category = torch.tensor(
+                transactions_df['presented_category_idx'].values, dtype=torch.long
+            )
             
         # Get t0 and t1 for ODE integration
         t0, t1 = 0.0, float(seq_len)
@@ -670,6 +701,13 @@ class TransactionFeedbackClassifier:
         else:
             y_category = self.graph['transaction'].y
             
+        # Get presented categories (model's initial prediction) if available  
+        y_presented = None
+        if hasattr(self.graph['transaction'], 'y_presented_category'):
+            y_presented = self.graph['transaction'].y_presented_category
+            print(f"Evaluating against presented categories as well")
+            
+        # For backwards compatibility, still get tax_type if available    
         if hasattr(self.graph['transaction'], 'y_tax_type'):
             y_tax_type = self.graph['transaction'].y_tax_type
         else:
@@ -717,7 +755,19 @@ class TransactionFeedbackClassifier:
                 y_category_pred = torch.argmax(category_logits[test_mask], dim=1).cpu().numpy()
                 y_tax_type_pred = torch.argmax(tax_type_logits[test_mask], dim=1).cpu().numpy()
                 
-                return {
+                # Calculate presented category metrics if available
+                presented_acc = 0.0
+                presented_f1 = 0.0
+                if y_presented is not None:
+                    presented_acc = self._compute_accuracy(
+                        category_logits[test_mask], y_presented[test_mask]
+                    )
+                    presented_f1 = self._compute_f1_score(
+                        category_logits[test_mask], y_presented[test_mask]
+                    )
+                    print(f"Accuracy vs presented categories: {presented_acc:.4f}")
+                
+                metrics = {
                     'test_loss': test_loss.item(),
                     'category_loss': category_loss.item(),
                     'category_acc': category_acc,
@@ -730,6 +780,16 @@ class TransactionFeedbackClassifier:
                     'y_tax_type_true': y_tax_type[test_mask].cpu().numpy(),
                     'y_tax_type_pred': y_tax_type_pred
                 }
+                
+                # Add presented category metrics if available
+                if y_presented is not None:
+                    metrics.update({
+                        'presented_acc': presented_acc,
+                        'presented_f1': presented_f1,
+                        'y_presented_true': y_presented[test_mask].cpu().numpy()
+                    })
+                
+                return metrics
             else:
                 # Single task metrics (category only)
                 test_loss = nn.functional.cross_entropy(
@@ -745,13 +805,35 @@ class TransactionFeedbackClassifier:
                 # Get predictions
                 y_category_pred = torch.argmax(logits[test_mask], dim=1).cpu().numpy()
                 
-                return {
+                # Calculate presented category metrics if available
+                presented_acc = 0.0
+                presented_f1 = 0.0
+                if y_presented is not None:
+                    presented_acc = self._compute_accuracy(
+                        logits[test_mask], y_presented[test_mask]
+                    )
+                    presented_f1 = self._compute_f1_score(
+                        logits[test_mask], y_presented[test_mask]
+                    )
+                    print(f"Accuracy vs presented categories: {presented_acc:.4f}")
+                
+                metrics = {
                     'test_loss': test_loss.item(),
                     'category_acc': category_acc,
                     'category_f1': category_f1,
                     'y_category_true': y_category[test_mask].cpu().numpy(),
                     'y_category_pred': y_category_pred
                 }
+                
+                # Add presented category metrics if available
+                if y_presented is not None:
+                    metrics.update({
+                        'presented_acc': presented_acc,
+                        'presented_f1': presented_f1,
+                        'y_presented_true': y_presented[test_mask].cpu().numpy()
+                    })
+                
+                return metrics
     
     def save_model(self, path: str) -> None:
         """

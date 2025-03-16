@@ -235,8 +235,14 @@ class TransactionGraphBuilder:
         
         # Process categorical features
         if categorical_cols:
+            # Convert all categorical columns to strings to ensure consistent data types for encoder
+            categorical_df = transactions_df[categorical_cols].copy()
+            for col in categorical_cols:
+                categorical_df[col] = categorical_df[col].astype(str)
+                
             encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-            transaction_cat_features = encoder.fit_transform(transactions_df[categorical_cols])
+            transaction_cat_features = encoder.fit_transform(categorical_df)
+            
             # Combine numerical and categorical features
             transaction_features = np.hstack([transaction_num_features, transaction_cat_features])
         else:
@@ -382,6 +388,9 @@ class TransactionGraphBuilder:
         # Categorical QBO features
         for col in ['qbo_signup_type_desc', 'qbo_current_product']:
             if col in transactions_df.columns:
+                # Convert to string to ensure consistent type
+                transactions_df[col] = transactions_df[col].astype(str)
+                
                 # Create mapping if not exists
                 if not hasattr(self, f'{col}_mapping'):
                     unique_values = transactions_df[col].unique()
@@ -390,8 +399,8 @@ class TransactionGraphBuilder:
                 # Get mapping
                 col_mapping = getattr(self, f'{col}_mapping')
                 
-                # One-hot encode
-                transactions_df[f'{col}_idx'] = transactions_df[col].map(col_mapping)
+                # One-hot encode with safe mapping that handles possible missing keys
+                transactions_df[f'{col}_idx'] = transactions_df[col].map(lambda x: col_mapping.get(x, 0))
                 unique_values = len(col_mapping)
                 col_features = np.eye(unique_values)[transactions_df[f'{col}_idx'].values]
                 qbo_status_features.append(col_features)
@@ -434,38 +443,53 @@ class TransactionGraphBuilder:
         
         # One-hot encode industry info if available
         if 'industry_code' in transactions_df.columns:
+            # Convert to string to ensure consistent type
+            transactions_df['industry_code'] = transactions_df['industry_code'].astype(str)
+            
             # Create mapping if not exists
             if not hasattr(self, 'industry_code_mapping'):
                 unique_industries = transactions_df['industry_code'].unique()
                 self.industry_code_mapping = {v: i for i, v in enumerate(unique_industries)}
             
-            # One-hot encode
-            transactions_df['industry_code_idx'] = transactions_df['industry_code'].map(self.industry_code_mapping)
+            # One-hot encode with safe mapping
+            transactions_df['industry_code_idx'] = transactions_df['industry_code'].map(
+                lambda x: self.industry_code_mapping.get(x, 0)
+            )
             unique_industries = len(self.industry_code_mapping)
             industry_code_features = np.eye(unique_industries)[transactions_df['industry_code_idx'].values]
             industry_features.append(industry_code_features)
         
         # Process region and language data
         if 'region_id' in transactions_df.columns:
+            # Convert to string to ensure consistent type
+            transactions_df['region_id'] = transactions_df['region_id'].astype(str)
+            
             # Create mapping if not exists
             if not hasattr(self, 'region_mapping'):
                 unique_regions = transactions_df['region_id'].unique()
                 self.region_mapping = {v: i for i, v in enumerate(unique_regions)}
             
-            # One-hot encode
-            transactions_df['region_idx'] = transactions_df['region_id'].map(self.region_mapping)
+            # One-hot encode with safe mapping
+            transactions_df['region_idx'] = transactions_df['region_id'].map(
+                lambda x: self.region_mapping.get(x, 0)
+            )
             unique_regions = len(self.region_mapping)
             region_features = np.eye(unique_regions)[transactions_df['region_idx'].values]
             industry_features.append(region_features)
         
         if 'language_id' in transactions_df.columns:
+            # Convert to string to ensure consistent type
+            transactions_df['language_id'] = transactions_df['language_id'].astype(str)
+            
             # Create mapping if not exists
             if not hasattr(self, 'language_mapping'):
                 unique_languages = transactions_df['language_id'].unique()
                 self.language_mapping = {v: i for i, v in enumerate(unique_languages)}
             
-            # One-hot encode
-            transactions_df['language_idx'] = transactions_df['language_id'].map(self.language_mapping)
+            # One-hot encode with safe mapping
+            transactions_df['language_idx'] = transactions_df['language_id'].map(
+                lambda x: self.language_mapping.get(x, 0)
+            )
             unique_languages = len(self.language_mapping)
             language_features = np.eye(unique_languages)[transactions_df['language_idx'].values]
             industry_features.append(language_features)

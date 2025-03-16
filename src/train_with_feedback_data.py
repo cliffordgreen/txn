@@ -30,7 +30,7 @@ def load_transaction_feedback_data(file_path: str) -> pd.DataFrame:
         file_path: Path to the CSV file
         
     Returns:
-        DataFrame containing transaction data
+        DataFrame containing transaction data with business entity features
     """
     print(f"Loading transaction data from {file_path}")
     df = pd.read_csv(file_path)
@@ -46,6 +46,11 @@ def load_transaction_feedback_data(file_path: str) -> pd.DataFrame:
         'presented_tax_account_type', 'presented_tax_account_type_name', 
         'accepted_category_id', 'accepted_category_name',
         'accepted_tax_account_type', 'accepted_tax_account_type_name'
+    ]
+    
+    # Business metadata columns (optional)
+    business_cols = [
+        'company_type', 'company_size'
     ]
     
     # Check required columns
@@ -65,6 +70,98 @@ def load_transaction_feedback_data(file_path: str) -> pd.DataFrame:
     missing_targets = [col for col in target_cols if col not in df.columns]
     if missing_targets:
         print(f"Warning: Missing target columns: {missing_targets}")
+    
+    # Check for business metadata columns
+    missing_business = [col for col in business_cols if col not in df.columns]
+    if missing_business:
+        print(f"Info: No company data columns found: {missing_business}. Adding synthetic data for demonstration.")
+        
+        # Add synthetic company data for demonstration purposes that matches our schema
+        
+        # QBO product tiers
+        qbo_products = ['Simple Start', 'Essentials', 'Plus', 'Advanced']
+        
+        # Industry types - based on small business categories
+        industry_types = ['Retail', 'Professional Services', 'Manufacturing', 'Construction', 
+                         'Healthcare', 'Food Service', 'Technology', 'Real Estate', 'Other Services']
+        
+        industry_codes = list(range(1, len(industry_types) + 1))
+        
+        # QBO signup types
+        signup_types = ['Direct', 'Partner', 'Trial', 'Conversion']
+        
+        # Region and language
+        regions = ['US_WEST', 'US_EAST', 'US_CENTRAL', 'CANADA', 'UK', 'APAC']
+        languages = ['en_US', 'en_CA', 'en_UK', 'es_US', 'fr_CA']
+        
+        # Generate industry info
+        df['industry_name'] = np.random.choice(industry_types, size=len(df))
+        df['industry_code'] = df['industry_name'].apply(lambda x: industry_types.index(x) + 1)
+        df['industry_standard'] = 'SIC'
+        
+        # Generate QBO product information
+        df['qbo_current_product'] = np.random.choice(
+            qbo_products, 
+            size=len(df), 
+            p=[0.35, 0.30, 0.25, 0.10]  # Weighted toward simpler products
+        )
+        
+        df['qbo_signup_type_desc'] = np.random.choice(signup_types, size=len(df))
+        
+        # Generate binary flags
+        df['qbo_accountant_attached_current_flag'] = np.random.choice([0, 1], size=len(df), p=[0.7, 0.3])
+        df['qbo_accountant_attached_ever'] = np.where(
+            df['qbo_accountant_attached_current_flag'] == 1, 1, np.random.choice([0, 1], size=len(df), p=[0.8, 0.2])
+        )
+        df['qblive_attach_flag'] = np.random.choice([0, 1], size=len(df), p=[0.85, 0.15])
+        
+        # Generate region and language data
+        df['region_id'] = np.random.randint(1, len(regions) + 1, size=len(df))
+        df['region_name'] = df['region_id'].apply(lambda x: regions[x-1])
+        df['language_id'] = np.random.randint(1, len(languages) + 1, size=len(df))
+        df['language_name'] = df['language_id'].apply(lambda x: languages[x-1])
+        
+        # Generate company ID and name
+        if 'company_id' not in df.columns:
+            df['company_id'] = np.random.randint(10000, 99999, size=len(df))
+            df['company_name'] = df['company_id'].apply(lambda x: f"Company {x}")
+        
+        # Generate some date information
+        today = pd.Timestamp.now()
+        df['qbo_signup_date'] = [today - pd.Timedelta(days=np.random.randint(30, 1500)) for _ in range(len(df))]
+        df['qbo_gns_date'] = df['qbo_signup_date'].apply(
+            lambda x: x + pd.Timedelta(days=np.random.randint(1, 30))
+        )
+        
+        # Make sure related transactions have the same company info
+        if 'user_id' in df.columns:
+            # Group by user_id and assign consistent company features within each user
+            for user_id in df['user_id'].unique():
+                user_indices = df[df['user_id'] == user_id].index
+                if len(user_indices) > 0:
+                    # Select random values for this user
+                    industry_name = np.random.choice(industry_types)
+                    industry_code = industry_types.index(industry_name) + 1
+                    qbo_product = np.random.choice(qbo_products)
+                    region_id = np.random.randint(1, len(regions) + 1)
+                    language_id = np.random.randint(1, len(languages) + 1)
+                    company_id = np.random.randint(10000, 99999)
+                    accountant_attached = np.random.choice([0, 1], p=[0.7, 0.3])
+                    
+                    # Assign consistent values
+                    df.loc[user_indices, 'industry_name'] = industry_name
+                    df.loc[user_indices, 'industry_code'] = industry_code
+                    df.loc[user_indices, 'qbo_current_product'] = qbo_product
+                    df.loc[user_indices, 'region_id'] = region_id
+                    df.loc[user_indices, 'region_name'] = regions[region_id-1]
+                    df.loc[user_indices, 'language_id'] = language_id
+                    df.loc[user_indices, 'language_name'] = languages[language_id-1]
+                    df.loc[user_indices, 'company_id'] = company_id
+                    df.loc[user_indices, 'company_name'] = f"Company {company_id}"
+                    df.loc[user_indices, 'qbo_accountant_attached_current_flag'] = accountant_attached
+                    df.loc[user_indices, 'qbo_accountant_attached_ever'] = accountant_attached
+    else:
+        print("Found business entity features: using real company data columns")
         
     return df
 
@@ -168,6 +265,25 @@ class TransactionFeedbackClassifier:
         else:
             user_features = None
             is_new_user = None
+            
+        # Get company features if available
+        company_features = None
+        if 'company' in self.graph.node_types:
+            # Check if there are transaction-to-company edges
+            if ('transaction', 'from_company', 'company') in self.graph.edge_types:
+                company_features = self.graph['company'].x
+                company_indices = self.graph['transaction', 'from_company', 'company'].edge_index[1]
+                
+                # If company features are indexed, we need to get the right ones for each transaction
+                if company_indices is not None:
+                    company_features = company_features[company_indices]
+            else:
+                # If no explicit edges, assume 1:1 mapping with transactions
+                company_features = self.graph['company'].x
+                
+            print(f"Using company features of shape: {company_features.shape}")
+        else:
+            print("No company features available in the graph")
         
         # Create dummy sequence features (we may not have temporal data)
         batch_size = transaction_features.size(0)
@@ -191,16 +307,17 @@ class TransactionFeedbackClassifier:
             
         return (
             transaction_features, seq_features, timestamps, 
-            user_features, is_new_user, transaction_descriptions, t0, t1
+            user_features, is_new_user, transaction_descriptions, company_features, t0, t1
         )
         
-    def initialize_model(self, input_dim: int, graph_input_dim: int = None) -> None:
+    def initialize_model(self, input_dim: int, graph_input_dim: int = None, company_input_dim: int = None) -> None:
         """
         Initialize the transaction model and optimizer.
         
         Args:
             input_dim: Dimension of input features
             graph_input_dim: Dimension of graph features (if different)
+            company_input_dim: Dimension of company features (if different)
         """
         # Set graph input dimension if provided
         if graph_input_dim is None:
@@ -214,7 +331,8 @@ class TransactionFeedbackClassifier:
                 hidden_dim=self.hidden_dim,
                 output_dim=self.category_dim,
                 num_models=self.ensemble_size,
-                dropout=self.dropout
+                dropout=self.dropout,
+                company_input_dim=company_input_dim
             )
         else:
             self.model = HyperTemporalTransactionModel(
@@ -229,6 +347,7 @@ class TransactionFeedbackClassifier:
                 use_text_processor=self.use_text,
                 text_processor_type=self.text_processor,
                 graph_input_dim=graph_input_dim,
+                company_input_dim=company_input_dim,
                 tax_type_output_dim=self.tax_type_dim,
                 multi_task=self.multi_task
             )
@@ -244,6 +363,7 @@ class TransactionFeedbackClassifier:
               timestamps: torch.Tensor, user_features: Optional[torch.Tensor] = None,
               is_new_user: Optional[torch.Tensor] = None, 
               transaction_descriptions: Optional[List[str]] = None,
+              company_features: Optional[torch.Tensor] = None,
               t0: float = 0.0, t1: float = 10.0,
               num_epochs: int = 100, patience: int = 10) -> dict:
         """
@@ -256,6 +376,7 @@ class TransactionFeedbackClassifier:
             user_features: User features (optional)
             is_new_user: Boolean tensor for new users (optional)
             transaction_descriptions: List of transaction descriptions (optional)
+            company_features: Company features (optional)
             t0: Start time for ODE integration
             t1: End time for ODE integration
             num_epochs: Maximum training epochs
@@ -343,7 +464,7 @@ class TransactionFeedbackClassifier:
                         transaction_features, seq_features, transaction_features,
                         timestamps, t0, t1, transaction_descriptions,
                         auto_align_dims=True, user_features=user_features,
-                        is_new_user=is_new_user
+                        is_new_user=is_new_user, company_features=company_features
                     )
                     
                     # Compute loss based on multi-task or single-task
@@ -375,7 +496,7 @@ class TransactionFeedbackClassifier:
                     transaction_features, seq_features, transaction_features,
                     timestamps, t0, t1, transaction_descriptions,
                     auto_align_dims=True, user_features=user_features,
-                    is_new_user=is_new_user
+                    is_new_user=is_new_user, company_features=company_features
                 )
                 
                 # Compute loss
@@ -423,7 +544,7 @@ class TransactionFeedbackClassifier:
                     transaction_features, seq_features, transaction_features,
                     timestamps, t0, t1, transaction_descriptions,
                     auto_align_dims=True, user_features=user_features,
-                    is_new_user=is_new_user
+                    is_new_user=is_new_user, company_features=company_features
                 )
                 
                 # Compute validation loss and accuracy
@@ -501,6 +622,7 @@ class TransactionFeedbackClassifier:
                 timestamps: torch.Tensor, user_features: Optional[torch.Tensor] = None,
                 is_new_user: Optional[torch.Tensor] = None, 
                 transaction_descriptions: Optional[List[str]] = None,
+                company_features: Optional[torch.Tensor] = None,
                 t0: float = 0.0, t1: float = 10.0) -> dict:
         """
         Evaluate the model on test data.
@@ -512,6 +634,7 @@ class TransactionFeedbackClassifier:
             user_features: User features (optional)
             is_new_user: Boolean tensor for new users (optional)
             transaction_descriptions: List of transaction descriptions (optional)
+            company_features: Company features (optional)
             t0: Start time for ODE integration
             t1: End time for ODE integration
             
@@ -558,7 +681,7 @@ class TransactionFeedbackClassifier:
                 transaction_features, seq_features, transaction_features,
                 timestamps, t0, t1, transaction_descriptions,
                 auto_align_dims=True, user_features=user_features,
-                is_new_user=is_new_user
+                is_new_user=is_new_user, company_features=company_features
             )
             
             # Compute metrics based on multi-task or single-task
@@ -823,34 +946,59 @@ def main():
         # Create user IDs
         user_ids = np.random.randint(0, num_users, num_transactions)
         
-        # Create synthetic transaction data
+        # Create synthetic transaction data with all the features from our schema
         transactions_df = pd.DataFrame({
             'user_id': user_ids,
             'txn_id': [f"txn_{i}" for i in range(num_transactions)],
             'is_new_user': np.random.choice([0, 1], num_transactions, p=[0.9, 0.1]),
             'presented_category_id': np.random.randint(0, num_categories, num_transactions),
             'presented_tax_account_type': np.random.randint(0, num_tax_types, num_transactions),
-            'conf_score': np.random.uniform(0.5, 1.0, num_transactions)
+            'conf_score': np.random.uniform(0.5, 1.0, num_transactions),
+            'amount': np.random.uniform(10.0, 1000.0, num_transactions),
+            'merchant_id': np.random.randint(0, 100, num_transactions),
+            'merchant_name': [f"Merchant {i}" for i in range(num_transactions)],
+            'merchant_city': np.random.choice(['San Francisco', 'New York', 'Chicago', 'Dallas', 'Seattle'], num_transactions),
+            'merchant_state': np.random.choice(['CA', 'NY', 'IL', 'TX', 'WA'], num_transactions),
+            'cleansed_description': [f"Payment for service {i}" for i in range(num_transactions)],
+            'raw_description': [f"PAYMENT FOR SERVICE {i}" for i in range(num_transactions)],
+            'memo': [f"Memo {i}" for i in np.random.randint(0, 1000, num_transactions)],
+            'posted_date': pd.date_range(start='2023-01-01', periods=num_transactions),
+            'siccode': np.random.randint(1000, 9999, num_transactions),
+            'mcc': np.random.randint(1000, 9999, num_transactions),
+            'mcc_name': np.random.choice(['Retail', 'Restaurant', 'Travel', 'Services', 'Utilities'], num_transactions),
+            'transaction_type': np.random.choice(['debit', 'credit'], num_transactions, p=[0.8, 0.2]),
+            'account_id': np.random.randint(1000, 9999, num_transactions),
+            'account_name': np.random.choice(['Checking', 'Savings', 'Credit Card', 'Business Account'], num_transactions),
+            'account_type_id': np.random.randint(1, 5, num_transactions),
+            'is_before_cutoff_date': np.random.choice([True, False], num_transactions, p=[0.8, 0.2]),
+            'locale': np.random.choice(['en_US', 'en_CA', 'es_US'], num_transactions, p=[0.8, 0.15, 0.05])
         })
         
         # Create matching accepted values (with some disagreements to simulate user feedback)
         transactions_df['accepted_category_id'] = transactions_df['presented_category_id'].copy()
         transactions_df['accepted_tax_account_type'] = transactions_df['presented_tax_account_type'].copy()
         
+        # Add category names
+        category_names = [f"Category_{i}" for i in range(num_categories)]
+        tax_type_names = [f"Tax_Type_{i}" for i in range(num_tax_types)]
+        
+        transactions_df['presented_category_name'] = transactions_df['presented_category_id'].apply(lambda x: category_names[x])
+        transactions_df['accepted_category_name'] = transactions_df['accepted_category_id'].apply(lambda x: category_names[x])
+        transactions_df['presented_tax_account_type_name'] = transactions_df['presented_tax_account_type'].apply(lambda x: tax_type_names[x])
+        transactions_df['accepted_tax_account_type_name'] = transactions_df['accepted_tax_account_type'].apply(lambda x: tax_type_names[x])
+        
         # Introduce some disagreements (user corrections)
         disagreement_mask = np.random.choice([0, 1], num_transactions, p=[0.8, 0.2])
         for idx in np.where(disagreement_mask)[0]:
             # Change some categories
-            transactions_df.loc[idx, 'accepted_category_id'] = (
-                transactions_df.loc[idx, 'presented_category_id'] + 
-                np.random.randint(1, 10)
-            ) % num_categories
+            new_cat_id = (transactions_df.loc[idx, 'presented_category_id'] + np.random.randint(1, 10)) % num_categories
+            transactions_df.loc[idx, 'accepted_category_id'] = new_cat_id
+            transactions_df.loc[idx, 'accepted_category_name'] = category_names[new_cat_id]
             
             # Change some tax types
-            transactions_df.loc[idx, 'accepted_tax_account_type'] = (
-                transactions_df.loc[idx, 'presented_tax_account_type'] + 
-                np.random.randint(1, 5)
-            ) % num_tax_types
+            new_tax_id = (transactions_df.loc[idx, 'presented_tax_account_type'] + np.random.randint(1, 5)) % num_tax_types
+            transactions_df.loc[idx, 'accepted_tax_account_type'] = new_tax_id
+            transactions_df.loc[idx, 'accepted_tax_account_type_name'] = tax_type_names[new_tax_id]
     
     # Initialize classifier
     print("\nInitializing transaction feedback classifier...")
@@ -874,13 +1022,19 @@ def main():
     # Prepare data
     print("\nPreparing transaction data...")
     (transaction_features, seq_features, timestamps, 
-     user_features, is_new_user, transaction_descriptions, t0, t1) = classifier.prepare_data(transactions_df)
+     user_features, is_new_user, transaction_descriptions, company_features, t0, t1) = classifier.prepare_data(transactions_df)
     
     # Get input dimension from transaction features
     input_dim = transaction_features.size(1)
     
+    # Get company input dimension if available
+    company_input_dim = None
+    if company_features is not None:
+        company_input_dim = company_features.size(1)
+        print(f"Company features dimension: {company_input_dim}")
+    
     # Initialize model
-    classifier.initialize_model(input_dim)
+    classifier.initialize_model(input_dim, graph_input_dim=input_dim, company_input_dim=company_input_dim)
     
     # Print model information
     num_params = sum(p.numel() for p in classifier.model.parameters() if p.requires_grad)
@@ -896,7 +1050,7 @@ def main():
     metrics = classifier.train(
         transaction_features, seq_features, timestamps,
         user_features, is_new_user, transaction_descriptions,
-        t0, t1, num_epochs=50, patience=10
+        company_features, t0, t1, num_epochs=50, patience=10
     )
     
     # Visualize training
@@ -907,7 +1061,7 @@ def main():
     test_metrics = classifier.evaluate(
         transaction_features, seq_features, timestamps,
         user_features, is_new_user, transaction_descriptions,
-        t0, t1
+        company_features, t0, t1
     )
     
     # Print evaluation results

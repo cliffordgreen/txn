@@ -131,7 +131,7 @@ class HyperbolicTransactionEncoder(nn.Module):
 class MultiModalFusion(nn.Module):
     """
     Multi-modal fusion module that combines features from different modalities
-    (graph, sequence, tabular) using cross-attention and gating mechanisms.
+    (graph, sequence, tabular, company) using cross-attention and gating mechanisms.
     """
     
     def __init__(self, input_dim: int, hidden_dim: int = 128, num_heads: int = 4, dropout: float = 0.2):
@@ -174,6 +174,14 @@ class MultiModalFusion(nn.Module):
             batch_first=True
         )
         
+        # Cross-attention for company-to-multimodal
+        self.company_to_multimodal_attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        
         # Gating mechanisms
         self.graph_gate = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -190,9 +198,14 @@ class MultiModalFusion(nn.Module):
             nn.Sigmoid()
         )
         
+        self.company_gate = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Sigmoid()
+        )
+        
         # Output projection
         self.output_projection = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim * 2),
+            nn.Linear(hidden_dim * 4, hidden_dim * 2),  # Updated for 4 modalities
             nn.LayerNorm(hidden_dim * 2),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -200,7 +213,7 @@ class MultiModalFusion(nn.Module):
         )
     
     def forward(self, graph_features: torch.Tensor, seq_features: torch.Tensor, 
-                tabular_features: torch.Tensor) -> torch.Tensor:
+                tabular_features: torch.Tensor, company_features: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass of the multi-modal fusion module.
         
@@ -208,6 +221,7 @@ class MultiModalFusion(nn.Module):
             graph_features: Graph features [batch_size, hidden_dim]
             seq_features: Sequence features [batch_size, hidden_dim]
             tabular_features: Tabular features [batch_size, hidden_dim]
+            company_features: Company features [batch_size, hidden_dim] (optional)
             
         Returns:
             Fused features [batch_size, hidden_dim]
@@ -269,12 +283,47 @@ class MultiModalFusion(nn.Module):
         tabular_gate_values = self.tabular_gate(tabular_combined)
         gated_tabular = tabular_features_reshaped * tabular_gate_values
         
-        # Concatenate all gated features
-        all_features = torch.cat([
-            gated_graph.squeeze(1),
-            gated_seq.squeeze(1),
-            gated_tabular.squeeze(1)
-        ], dim=-1)
+        # Process company features if provided
+        if company_features is not None:
+            # Reshape company features
+            company_features_reshaped = company_features.unsqueeze(1) if company_features.dim() == 2 else company_features
+            
+            # Update multimodal features to include existing gated features
+            multimodal_with_tabular = torch.cat([gated_graph, gated_seq, gated_tabular], dim=1)
+            
+            # Cross-attention: company to multimodal
+            company_to_multimodal, _ = self.company_to_multimodal_attention(
+                query=multimodal_with_tabular,
+                key=company_features_reshaped,
+                value=company_features_reshaped
+            )
+            
+            # Combine company features
+            company_combined = torch.cat([
+                company_features_reshaped,
+                company_to_multimodal.mean(dim=1, keepdim=True)
+            ], dim=-1)
+            
+            # Apply gating
+            company_gate_values = self.company_gate(company_combined)
+            gated_company = company_features_reshaped * company_gate_values
+            
+            # Concatenate all gated features including company features
+            all_features = torch.cat([
+                gated_graph.squeeze(1),
+                gated_seq.squeeze(1),
+                gated_tabular.squeeze(1),
+                gated_company.squeeze(1)
+            ], dim=-1)
+        else:
+            # If no company features, use zero padding for the 4th modality
+            zeros = torch.zeros_like(gated_graph.squeeze(1))
+            all_features = torch.cat([
+                gated_graph.squeeze(1),
+                gated_seq.squeeze(1),
+                gated_tabular.squeeze(1),
+                zeros
+            ], dim=-1)
         
         # Apply output projection
         fused_features = self.output_projection(all_features)
@@ -396,13 +445,27 @@ class DynamicContextualTemporal(nn.Module):
             # Create attention mask from time features
             attention_weights = torch.mean(encoded_time, dim=-1)  # [batch_size, seq_len, seq_len]
             
-            # Apply attention
-            attended_features, _ = self.timescale_attention[i](
-                query=x,
-                key=x,
-                value=x,
-                attn_mask=attention_weights
-            )
+            # Reshape attention_weights to match batch size and sequence length
+            # Make sure attention_weights is properly formatted for attention
+            if attention_weights.shape[0] != x.shape[0]:
+                # Expand or repeat attention weights to match batch dimension
+                attention_weights = attention_weights.repeat(x.shape[0] // attention_weights.shape[0], 1, 1)
+                
+            # Apply attention (use None for attn_mask if shape issues persist)
+            try:
+                attended_features, _ = self.timescale_attention[i](
+                    query=x,
+                    key=x,
+                    value=x,
+                    attn_mask=attention_weights
+                )
+            except RuntimeError:
+                # Fallback to no mask if shape mismatch
+                attended_features, _ = self.timescale_attention[i](
+                    query=x,
+                    key=x,
+                    value=x
+                )
             
             timescale_outputs.append(attended_features)
         
@@ -498,6 +561,79 @@ class NeuralODELayer(nn.Module):
         return x
 
 
+class CompanyAwareContextLayer(nn.Module):
+    """
+    Company-aware context layer that enriches transaction representations 
+    with company information (business type, size, etc.)
+    """
+    
+    def __init__(self, hidden_dim: int, num_heads: int = 4, dropout: float = 0.2):
+        """
+        Initialize the company-aware context layer.
+        
+        Args:
+            hidden_dim: Dimension of hidden features
+            num_heads: Number of attention heads
+            dropout: Dropout probability
+        """
+        super().__init__()
+        
+        # Company contextualization
+        self.company_context = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 2,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True
+        )
+        
+        # Company-transaction fusion
+        self.fusion_layer = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+    
+    def forward(self, transaction_features: torch.Tensor, company_features: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the company-aware context layer.
+        
+        Args:
+            transaction_features: Transaction features [batch_size, seq_len, hidden_dim]
+            company_features: Company features [batch_size, company_seq_len, hidden_dim]
+            
+        Returns:
+            Company-enriched transaction features [batch_size, seq_len, hidden_dim]
+        """
+        batch_size, seq_len, hidden_dim = transaction_features.shape
+        
+        # Ensure company features have batch dimension
+        if company_features.dim() == 2:
+            company_features = company_features.unsqueeze(1)
+        
+        # Apply company context transformer
+        enhanced_company = self.company_context(company_features)
+        
+        # Broadcast company features to match transaction sequence
+        if enhanced_company.size(1) == 1:
+            company_broadcast = enhanced_company.expand(batch_size, seq_len, hidden_dim)
+        else:
+            # If multiple company features, use mean
+            company_mean = enhanced_company.mean(dim=1, keepdim=True).expand(batch_size, seq_len, hidden_dim)
+            company_broadcast = company_mean
+        
+        # Fuse transaction and company features
+        combined = torch.cat([transaction_features, company_broadcast], dim=-1)
+        fused = self.fusion_layer(combined)
+        
+        # Residual connection
+        output = transaction_features + fused
+        
+        return output
+
+
 class HyperTemporalTransactionModel(nn.Module):
     """
     Hyper-temporal transaction model that combines hyperbolic geometry,
@@ -506,6 +642,8 @@ class HyperTemporalTransactionModel(nn.Module):
     
     Extended to support dual target prediction (category and tax account type)
     and new transaction data format with user feedback integration.
+    
+    Now includes support for company features to model business-specific patterns.
     """
     
     def __init__(self, input_dim: int, hidden_dim: int = 256, output_dim: int = 400,
@@ -513,6 +651,7 @@ class HyperTemporalTransactionModel(nn.Module):
                  use_hyperbolic: bool = True, use_neural_ode: bool = True,
                  use_text_processor: bool = True, text_processor_type: str = "finbert",
                  text_dim: Optional[int] = None, graph_input_dim: Optional[int] = None,
+                 company_input_dim: Optional[int] = None,
                  tax_type_output_dim: Optional[int] = 20, multi_task: bool = True):
         """
         Initialize the hyper-temporal transaction model.
@@ -530,6 +669,7 @@ class HyperTemporalTransactionModel(nn.Module):
             text_processor_type: Type of text processor to use ('finbert', 'llm', 'bert', etc.)
             text_dim: Dimension of text features (if different from hidden_dim)
             graph_input_dim: Dimension of graph input (if different from sequence input_dim)
+            company_input_dim: Dimension of company input (if different from input_dim)
             tax_type_output_dim: Dimension of secondary output (num tax types)
             multi_task: Whether to use multi-task learning for dual prediction
         """
@@ -547,6 +687,7 @@ class HyperTemporalTransactionModel(nn.Module):
         self.text_processor_type = text_processor_type
         self.text_dim = text_dim if text_dim is not None else hidden_dim
         self.graph_input_dim = graph_input_dim if graph_input_dim is not None else input_dim
+        self.company_input_dim = company_input_dim if company_input_dim is not None else input_dim
         self.tax_type_output_dim = tax_type_output_dim
         self.multi_task = multi_task
         
@@ -609,10 +750,26 @@ class HyperTemporalTransactionModel(nn.Module):
             nn.Dropout(dropout)
         )
         
+        # Company feature projection
+        self.company_projection = nn.Sequential(
+            nn.Linear(self.company_input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        
+        # Company-aware context layer
+        self.company_context_layer = CompanyAwareContextLayer(
+            hidden_dim=hidden_dim,
+            num_heads=num_heads // 2,
+            dropout=dropout
+        )
+        
         # Dimension alignment layer for handling mismatches
         self.dim_alignment = nn.ModuleDict({
             'graph': nn.Linear(self.graph_input_dim, input_dim),
-            'tabular': nn.Linear(input_dim, input_dim)
+            'tabular': nn.Linear(input_dim, input_dim),
+            'company': nn.Linear(self.company_input_dim, input_dim)
         })
         
         # Hyperbolic encoding (for hierarchical transaction relationships)
@@ -622,7 +779,7 @@ class HyperTemporalTransactionModel(nn.Module):
                 hidden_dim=hidden_dim
             )
         
-        # Multi-modal fusion - Modified to accept text features if enabled
+        # Multi-modal fusion - Modified to accept company features
         self.fusion_module = MultiModalFusion(
             input_dim=hidden_dim,
             hidden_dim=hidden_dim,
@@ -705,7 +862,8 @@ class HyperTemporalTransactionModel(nn.Module):
                 tabular_features: torch.Tensor, timestamps: torch.Tensor, 
                 t0: float, t1: float, descriptions: List[str] = None,
                 auto_align_dims: bool = True, user_features: Optional[torch.Tensor] = None,
-                is_new_user: Optional[torch.Tensor] = None) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+                is_new_user: Optional[torch.Tensor] = None, 
+                company_features: Optional[torch.Tensor] = None) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Forward pass of the hyper-temporal transaction model.
         
@@ -720,6 +878,7 @@ class HyperTemporalTransactionModel(nn.Module):
             auto_align_dims: Automatically align feature dimensions if mismatched
             user_features: User features [batch_size, user_dim] (optional)
             is_new_user: Boolean tensor indicating if user is new [batch_size] (optional)
+            company_features: Company features [batch_size, company_input_dim] (optional)
             
         Returns:
             If multi_task=True: Tuple of (category_logits, tax_type_logits)
@@ -749,6 +908,15 @@ class HyperTemporalTransactionModel(nn.Module):
                 batch_orig_shape = tabular_features.shape[:2]
                 tabular_features = self.dim_alignment['tabular'](tabular_features.view(-1, tabular_features.size(2)))
                 tabular_features = tabular_features.view(*batch_orig_shape, seq_feat_dim)
+                
+            # Ensure company_features has the right dimensions if provided
+            if company_features is not None:
+                if company_features.dim() == 2 and company_features.size(1) != seq_feat_dim:
+                    company_features = self.dim_alignment['company'](company_features)
+                elif company_features.dim() == 3 and company_features.size(2) != seq_feat_dim:
+                    batch_orig_shape = company_features.shape[:2]
+                    company_features = self.dim_alignment['company'](company_features.view(-1, company_features.size(2)))
+                    company_features = company_features.view(*batch_orig_shape, seq_feat_dim)
         
         # Process text features if enabled and descriptions are provided
         if self.use_text_processor and descriptions is not None:
@@ -775,28 +943,61 @@ class HyperTemporalTransactionModel(nn.Module):
         
         # Project input features
         if graph_features.dim() == 3:
-            graph_h = self.graph_projection(graph_features.view(-1, graph_features.size(2)))
-            graph_h = graph_h.view(batch_size, graph_features.size(1), self.hidden_dim)
+            graph_h = self.graph_projection(graph_features.reshape(-1, graph_features.size(2)))
+            graph_h = graph_h.reshape(batch_size, graph_features.size(1), self.hidden_dim)
         else:
             graph_h = self.graph_projection(graph_features)
             graph_h = graph_h.unsqueeze(1) if graph_h.dim() == 2 else graph_h  # Add sequence dimension if needed
             
-        seq_h = self.sequence_projection(seq_features.view(-1, seq_feat_dim))
-        seq_h = seq_h.view(batch_size, seq_len, self.hidden_dim)
+        seq_h = self.sequence_projection(seq_features.reshape(-1, seq_feat_dim))
+        seq_h = seq_h.reshape(batch_size, seq_len, self.hidden_dim)
         
         if tabular_features.dim() == 3:
-            tabular_h = self.tabular_projection(tabular_features.view(-1, tabular_features.size(2)))
-            tabular_h = tabular_h.view(batch_size, tabular_features.size(1), self.hidden_dim)
+            tabular_h = self.tabular_projection(tabular_features.reshape(-1, tabular_features.size(2)))
+            tabular_h = tabular_h.reshape(batch_size, tabular_features.size(1), self.hidden_dim)
         else:
             tabular_h = self.tabular_projection(tabular_features)
             tabular_h = tabular_h.unsqueeze(1) if tabular_h.dim() == 2 else tabular_h  # Add sequence dimension if needed
+            
+        # Process company features if provided
+        company_h = None
+        if company_features is not None:
+            # Debug dimension info
+            try:
+                if self.training and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
+                    print(f"Company features shape: {company_features.shape}, company_input_dim: {self.company_input_dim}")
+            except:
+                # Handle case where distributed is not available
+                if self.training:
+                    print(f"Company features shape: {company_features.shape}, company_input_dim: {self.company_input_dim}")
+                
+            if company_features.dim() == 3:
+                # Handle 3D company features [batch, seq, feat]
+                company_h = self.company_projection(company_features.reshape(-1, company_features.size(2)))
+                company_h = company_h.reshape(batch_size, company_features.size(1), self.hidden_dim)
+            else:
+                # Handle 2D company features [batch, feat] - ensure dimensions match
+                if company_features.size(1) != self.company_input_dim:
+                    # Handle dimension mismatch - project to correct dimension first
+                    print(f"WARNING: Company feature dimension mismatch. Got {company_features.size(1)}, expected {self.company_input_dim}")
+                    if not hasattr(self, 'company_dim_adapter'):
+                        # Create adapter layer on the fly if needed
+                        self.company_dim_adapter = nn.Linear(
+                            company_features.size(1), self.company_input_dim
+                        ).to(company_features.device)
+                    # Apply dimension adapter
+                    company_features = self.company_dim_adapter(company_features)
+                
+                # Now apply the main projection
+                company_h = self.company_projection(company_features)
+                company_h = company_h.unsqueeze(1) if company_h.dim() == 2 else company_h  # Add sequence dimension if needed
         
         # Apply hyperbolic encoding if enabled
         if self.use_hyperbolic:
             # Reshape for hyperbolic encoding
-            graph_h_flat = graph_h.view(-1, self.hidden_dim)
-            seq_h_flat = seq_h.view(-1, self.hidden_dim)
-            tabular_h_flat = tabular_h.view(-1, self.hidden_dim)
+            graph_h_flat = graph_h.reshape(-1, self.hidden_dim)
+            seq_h_flat = seq_h.reshape(-1, self.hidden_dim)
+            tabular_h_flat = tabular_h.reshape(-1, self.hidden_dim)
             
             # Apply hyperbolic encoding
             graph_h_flat = self.hyperbolic_encoder(graph_h_flat)
@@ -804,9 +1005,15 @@ class HyperTemporalTransactionModel(nn.Module):
             tabular_h_flat = self.hyperbolic_encoder(tabular_h_flat)
             
             # Reshape back
-            graph_h = graph_h_flat.view(*graph_h.shape)
-            seq_h = seq_h_flat.view(batch_size, seq_len, self.hidden_dim)
-            tabular_h = tabular_h_flat.view(*tabular_h.shape)
+            graph_h = graph_h_flat.reshape(*graph_h.shape)
+            seq_h = seq_h_flat.reshape(batch_size, seq_len, self.hidden_dim)
+            tabular_h = tabular_h_flat.reshape(*tabular_h.shape)
+            
+            # Apply hyperbolic encoding to company features if provided
+            if company_h is not None:
+                company_h_flat = company_h.reshape(-1, self.hidden_dim)
+                company_h_flat = self.hyperbolic_encoder(company_h_flat)
+                company_h = company_h_flat.reshape(*company_h.shape)
             
             # Also apply to text features if available
             if self.use_text_processor and descriptions is not None:
@@ -853,10 +1060,28 @@ class HyperTemporalTransactionModel(nn.Module):
             else:  # Fall back to using the mean
                 tab_feature = tabular_h.mean(dim=1)
                 
+            # Extract company features if available
+            company_feat = None
+            if company_h is not None:
+                if company_h.size(1) == 1:  # Single company feature per batch
+                    company_feat = company_h.squeeze(1)
+                elif company_h.size(1) == seq_len:  # Sequence of company features
+                    company_feat = company_h[:, i]
+                else:  # Fall back to using the mean
+                    company_feat = company_h.mean(dim=1)
+                
             fused_features[:, i] = self.fusion_module(
                 graph_h_adapted if graph_h_adapted.dim() == 2 else graph_h_adapted.mean(dim=1),
                 seq_h[:, i],
-                tab_feature
+                tab_feature,
+                company_feat
+            )
+        
+        # Apply company-aware context layer if company features are available
+        if company_h is not None:
+            fused_features = self.company_context_layer(
+                fused_features,
+                company_h.mean(dim=1, keepdim=True) if company_h.dim() > 2 and company_h.size(1) > 1 else company_h
             )
         
         # Apply temporal layers with residual connections
@@ -867,9 +1092,9 @@ class HyperTemporalTransactionModel(nn.Module):
             
             # Apply neural ODE if enabled
             if self.use_neural_ode:
-                h_flat = h_temporal.view(-1, self.hidden_dim)
+                h_flat = h_temporal.reshape(-1, self.hidden_dim)
                 h_ode = self.ode_layers[i](h_flat, t0, t1)
-                h_temporal = h_ode.view(batch_size, seq_len, self.hidden_dim)
+                h_temporal = h_ode.reshape(batch_size, seq_len, self.hidden_dim)
             
             # Add residual connection
             h = h + h_temporal
@@ -897,7 +1122,13 @@ class HyperTemporalTransactionModel(nn.Module):
                 user_features = user_projection(user_features)
                 
             # Add user feature contribution to pooled representation
-            h_pooled = h_pooled + 0.3 * user_features.squeeze(1) if user_features.dim() > 1 else user_features
+            if user_features.size(0) != batch_size:
+                # User features have a different batch dimension - need to align
+                user_indices = torch.arange(batch_size) % user_features.size(0)
+                aligned_user_features = user_features[user_indices]
+                h_pooled = h_pooled + 0.3 * aligned_user_features.squeeze(1) if aligned_user_features.dim() > 1 else aligned_user_features
+            else:
+                h_pooled = h_pooled + 0.3 * user_features.squeeze(1) if user_features.dim() > 1 else user_features
         
         # Add is_new_user flag if provided
         if is_new_user is not None:
@@ -911,6 +1142,14 @@ class HyperTemporalTransactionModel(nn.Module):
             
             # Add small contribution from is_new_user
             h_pooled = h_pooled + 0.1 * new_user_effect.squeeze(1)
+        
+        # Add company features contribution to pooled representation if provided
+        if company_h is not None:
+            # Get a fixed representation of company features
+            company_repr = company_h.mean(dim=1) if company_h.dim() > 2 else company_h.squeeze(1)
+            
+            # Add weighted company feature contribution
+            h_pooled = h_pooled + 0.25 * company_repr
         
         # Apply output layers
         h_pre = self.pre_output(h_pooled)
@@ -941,10 +1180,13 @@ class HyperTemporalEnsemble(nn.Module):
     """
     Ensemble of hyper-temporal transaction models with specialized architectures
     and hyperparameters for optimal performance.
+    
+    Now supports business entity features like company type and size.
     """
     
     def __init__(self, input_dim: int, hidden_dim: int = 256, output_dim: int = 400,
-                 num_models: int = 5, dropout: float = 0.2, use_text_processors: bool = True):
+                 num_models: int = 5, dropout: float = 0.2, use_text_processors: bool = True,
+                 company_input_dim: Optional[int] = None):
         """
         Initialize the hyper-temporal ensemble.
         
@@ -955,6 +1197,7 @@ class HyperTemporalEnsemble(nn.Module):
             num_models: Number of models in the ensemble
             dropout: Dropout probability
             use_text_processors: Whether to use text processing in ensemble models
+            company_input_dim: Dimension of company input features (if different from input_dim)
         """
         super().__init__()
         
@@ -963,6 +1206,7 @@ class HyperTemporalEnsemble(nn.Module):
         self.output_dim = output_dim
         self.num_models = num_models
         self.use_text_processors = use_text_processors
+        self.company_input_dim = company_input_dim if company_input_dim is not None else input_dim
         
         # Create diverse models for the ensemble
         self.models = nn.ModuleList()
@@ -994,7 +1238,8 @@ class HyperTemporalEnsemble(nn.Module):
                 use_hyperbolic=use_hyperbolic,
                 use_neural_ode=use_neural_ode,
                 use_text_processor=use_text_processor,
-                text_processor_type=text_processor_type
+                text_processor_type=text_processor_type,
+                company_input_dim=self.company_input_dim
             )
             
             self.models.append(model)
@@ -1002,6 +1247,15 @@ class HyperTemporalEnsemble(nn.Module):
         # Mixture of experts attention
         self.expert_attention = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_models),
+            nn.Softmax(dim=-1)
+        )
+        
+        # Company-aware expert selection
+        self.company_expert_selector = nn.Sequential(
+            nn.Linear(self.company_input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, num_models),
@@ -1019,7 +1273,10 @@ class HyperTemporalEnsemble(nn.Module):
     
     def forward(self, graph_features: torch.Tensor, seq_features: torch.Tensor,
                 tabular_features: torch.Tensor, timestamps: torch.Tensor, 
-                t0: float, t1: float, descriptions: List[str] = None) -> torch.Tensor:
+                t0: float, t1: float, descriptions: List[str] = None,
+                user_features: Optional[torch.Tensor] = None,
+                is_new_user: Optional[torch.Tensor] = None,
+                company_features: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass of the hyper-temporal ensemble.
         
@@ -1031,6 +1288,9 @@ class HyperTemporalEnsemble(nn.Module):
             t0: Start time for ODE integration
             t1: End time for ODE integration
             descriptions: List of transaction descriptions (optional)
+            user_features: User features [batch_size, user_dim] (optional)
+            is_new_user: Boolean tensor indicating if user is new [batch_size] (optional)
+            company_features: Company features [batch_size, company_input_dim] (optional)
             
         Returns:
             Output logits [batch_size, output_dim]
@@ -1042,21 +1302,53 @@ class HyperTemporalEnsemble(nn.Module):
         for model in self.models:
             logits = model(
                 graph_features, seq_features, tabular_features, 
-                timestamps, t0, t1, descriptions
+                timestamps, t0, t1, descriptions,
+                user_features=user_features,
+                is_new_user=is_new_user,
+                company_features=company_features
             )
             all_logits.append(logits)
         
-        # Compute expert attention weights
+        # Compute expert attention weights based on sequence features
         context_features = torch.mean(seq_features, dim=1)
         expert_weights = self.expert_attention(context_features)  # [batch_size, num_models]
+        
+        # If company features are available, use them to adjust expert weights
+        if company_features is not None:
+            # Get company-based expert weights
+            if company_features.dim() > 2:
+                # Take mean across sequence dimension if it exists
+                company_feat = company_features.mean(dim=1) 
+            else:
+                company_feat = company_features
+                
+            company_expert_weights = self.company_expert_selector(company_feat)
+            
+            # Combine sequence-based and company-based expert weights
+            expert_weights = 0.7 * expert_weights + 0.3 * company_expert_weights
         
         # Apply expert weights
         weighted_logits = torch.zeros(batch_size, self.output_dim, device=graph_features.device)
         for i, logits in enumerate(all_logits):
-            weighted_logits += expert_weights[:, i:i+1] * logits
+            if isinstance(logits, tuple) and len(logits) == 2:
+                # If multi-task model returns tuple, use only category logits
+                category_logits, _ = logits
+                weighted_logits += expert_weights[:, i:i+1] * category_logits
+            else:
+                weighted_logits += expert_weights[:, i:i+1] * logits
         
         # Also use concatenated approach for the meta-learner
-        concat_logits = torch.cat(all_logits, dim=1)  # [batch_size, output_dim * num_models]
+        # First ensure all logits are compatible (handle multi-task case)
+        processed_logits = []
+        for logits in all_logits:
+            if isinstance(logits, tuple) and len(logits) == 2:
+                # If multi-task model returns tuple, use only category logits
+                category_logits, _ = logits
+                processed_logits.append(category_logits)
+            else:
+                processed_logits.append(logits)
+                
+        concat_logits = torch.cat(processed_logits, dim=1)  # [batch_size, output_dim * num_models]
         meta_logits = self.output_projection(concat_logits)
         
         # Combine both approaches

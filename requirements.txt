@@ -1,0 +1,33 @@
+# Core dependencies
+numpy>=1.19.0
+pandas>=1.1.0
+scikit-learn>=0.23.2
+torch>=1.7.0
+torch-geometric>=2.0.0
+torch-scatter>=2.0.8
+torch-sparse>=0.6.12
+torch-cluster>=1.5.9
+torch-spline-conv>=1.2.1
+matplotlib>=3.3.0
+seaborn>=0.11.0
+tqdm>=4.50.0
+
+# NLP and Transformer models
+transformers>=4.30.0
+sentencepiece>=0.1.99
+datasets>=2.12.0
+tokenizers>=0.13.0
+
+# LLM Integration (optional)
+openai>=1.0.0
+tiktoken>=0.4.0
+
+# Neural ODE
+torchdiffeq>=0.2.3
+
+# For visualization and monitoring
+tensorboard>=2.12.0
+
+# For notebooks
+jupyter>=1.0.0
+notebook>=6.1.0

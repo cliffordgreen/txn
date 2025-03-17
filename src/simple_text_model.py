@@ -27,7 +27,7 @@ class SimpleTextClassifier(nn.Module):
             self.text_processor = FinBERTProcessor(
                 output_dim=input_dim,
                 pooling_strategy="mean",
-                test_mode=True  # Using test mode for quicker execution
+                test_mode=False  # Using test mode for quicker execution
             )
         
         # Classification layers

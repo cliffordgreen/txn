@@ -1,811 +1,346 @@
-import os
+import torch
 import numpy as np
 import pandas as pd
-import torch
-from torch_geometric.data import Data, HeteroData
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
-from typing import Dict, List, Tuple, Optional
-
-class TransactionGraphBuilder:
-    """
-    Class for building a heterogeneous graph from transaction data for GNN-based classification.
-    The graph consists of transaction nodes, merchant nodes, and category nodes with edges between them.
-    
-    Modified to handle the new format with user feedback data, including tax account types
-    and dual-target classification (category and tax account type).
-    
-    Now includes support for business entity data like company type and size as optional features.
-    """
-    
-    def __init__(self, num_categories: int = 400, num_tax_types: int = 20):
-        """
-        Initialize the TransactionGraphBuilder.
-        
-        Args:
-            num_categories: Total number of transaction categories (default: 400)
-            num_tax_types: Total number of tax account types (default: 20)
-        """
-        self.num_categories = num_categories
-        self.num_tax_types = num_tax_types
-        self.transaction_features = None
-        self.merchant_features = None
-        self.user_features = None
-        self.company_features = None  # Added for business entity data
-        self.category_mapping = None
-        self.tax_type_mapping = None
-        self.merchant_mapping = None
-        self.user_mapping = None
-        self.company_type_mapping = None  # Mapping for company types
-        self.company_size_mapping = None  # Mapping for company sizes
-    
-    def preprocess_transactions(self, transactions_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Preprocess transaction data by handling missing values, encoding categorical features,
-        and normalizing numerical features.
-        
-        Modified to handle the new format with user feedback data and dual classification targets.
-        Also supports optional business metadata like company type and size.
-        
-        Args:
-            transactions_df: DataFrame containing transaction data
-            
-        Returns:
-            Preprocessed DataFrame
-        """
-        # Make a copy to avoid modifying the original dataframe
-        df = transactions_df.copy()
-        
-        # Handle missing values
-        for col in df.columns:
-            if df[col].dtype == 'object':
-                # Fix pandas warning about chained assignment with inplace=True
-                df[col] = df[col].fillna('unknown')
-            else:
-                # Fix pandas warning about chained assignment with inplace=True
-                df[col] = df[col].fillna(df[col].median())
-        
-        # Add merchant_id if not present (use txn_id as fallback)
-        if 'merchant_id' not in df.columns:
-            if 'model_provider' in df.columns:
-                # Use model_provider as a proxy for merchant if available
-                df['merchant_id'] = df['model_provider'].astype(str)
-            else:
-                # Otherwise generate a random merchant_id (for testing only) as strings
-                df['merchant_id'] = [f"m{i}" for i in np.random.randint(0, 100, size=len(df))]
-        
-        # Process company metadata if available
-        # Handle company_type from industry info
-        if 'industry_name' in df.columns:
-            if self.company_type_mapping is None:
-                unique_industry_types = df['industry_name'].unique()
-                self.company_type_mapping = {t: i for i, t in enumerate(unique_industry_types)}
-            df['company_type_idx'] = df['industry_name'].map(self.company_type_mapping)
-        elif 'company_type' in df.columns:
-            if self.company_type_mapping is None:
-                unique_company_types = df['company_type'].unique()
-                self.company_type_mapping = {t: i for i, t in enumerate(unique_company_types)}
-            df['company_type_idx'] = df['company_type'].map(self.company_type_mapping)
-        
-        # Handle company_size from QBO product info
-        if 'qbo_current_product' in df.columns:
-            if self.company_size_mapping is None:
-                unique_product_types = df['qbo_current_product'].unique()
-                self.company_size_mapping = {s: i for i, s in enumerate(unique_product_types)}
-            df['company_size_idx'] = df['qbo_current_product'].map(self.company_size_mapping)
-        elif 'company_size' in df.columns:
-            if self.company_size_mapping is None:
-                unique_company_sizes = df['company_size'].unique()
-                self.company_size_mapping = {s: i for i, s in enumerate(unique_company_sizes)}
-            df['company_size_idx'] = df['company_size'].map(self.company_size_mapping)
-        
-        # Create necessary mappings for the new data format
-        
-        # User mapping
-        if self.user_mapping is None and 'user_id' in df.columns:
-            unique_users = df['user_id'].unique()
-            self.user_mapping = {u: i for i, u in enumerate(unique_users)}
-            df['user_idx'] = df['user_id'].map(self.user_mapping)
-        elif 'user_id' in df.columns:
-            df['user_idx'] = df['user_id'].map(self.user_mapping)
-        else:
-            # If no user_id, create a dummy one
-            df['user_id'] = range(len(df))
-            df['user_idx'] = df['user_id']
-            self.user_mapping = {i: i for i in range(len(df))}
-        
-        # Merchant mapping
-        if self.merchant_mapping is None:
-            unique_merchants = df['merchant_id'].unique()
-            self.merchant_mapping = {m: i for i, m in enumerate(unique_merchants)}
-        df['merchant_idx'] = df['merchant_id'].map(self.merchant_mapping)
-        
-        # Category mapping - use accepted_category_id or presented_category_id if available, otherwise fallback
-        cat_id_col = None
-        if 'accepted_category_id' in df.columns:
-            cat_id_col = 'accepted_category_id'
-        elif 'presented_category_id' in df.columns:
-            cat_id_col = 'presented_category_id'
-        elif 'category_id' in df.columns:
-            cat_id_col = 'category_id'
-        
-        if cat_id_col:
-            if self.category_mapping is None:
-                unique_categories = df[cat_id_col].unique()
-                self.category_mapping = {c: i for i, c in enumerate(unique_categories)}
-            df['category_idx'] = df[cat_id_col].map(self.category_mapping)
-        else:
-            # If no category id columns, create a dummy classification target
-            # Use random integers in the appropriate range
-            df['category_id'] = np.random.randint(0, self.num_categories, size=len(df))
-            if self.category_mapping is None:
-                unique_categories = df['category_id'].unique()
-                self.category_mapping = {c: i for i, c in enumerate(unique_categories)}
-            df['category_idx'] = df['category_id'].map(self.category_mapping)
-        
-        # Tax account type mapping - use accepted_tax_account_type or presented_tax_account_type if available
-        tax_type_col = None
-        if 'accepted_tax_account_type' in df.columns:
-            tax_type_col = 'accepted_tax_account_type'
-        elif 'presented_tax_account_type' in df.columns:
-            tax_type_col = 'presented_tax_account_type'
-        
-        if tax_type_col:
-            if self.tax_type_mapping is None:
-                unique_tax_types = df[tax_type_col].unique()
-                self.tax_type_mapping = {t: i for i, t in enumerate(unique_tax_types)}
-            df['tax_type_idx'] = df[tax_type_col].map(self.tax_type_mapping)
-        else:
-            # If no tax type columns, create a dummy classification target
-            # Use random integers in the appropriate range
-            df['tax_account_type'] = np.random.randint(0, self.num_tax_types, size=len(df))
-            if self.tax_type_mapping is None:
-                unique_tax_types = df['tax_account_type'].unique()
-                self.tax_type_mapping = {t: i for i, t in enumerate(unique_tax_types)}
-            df['tax_type_idx'] = df['tax_account_type'].map(self.tax_type_mapping)
-        
-        # Add is_new_user if not present
-        if 'is_new_user' not in df.columns:
-            df['is_new_user'] = 0  # Default to not new
-            
-        return df
-    
-    def extract_features(self, transactions_df: pd.DataFrame) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Extract and normalize features for transactions, merchants, users, and company data.
-        
-        Modified to handle the new data format, additional features, and business metadata.
-        
-        Args:
-            transactions_df: Preprocessed transaction DataFrame
-            
-        Returns:
-            Tuple of (transaction_features, merchant_features, user_features, company_features) as PyTorch tensors
-        """
-        # Numerical features for transactions
-        # Exclude indexes and target columns from features
-        exclude_cols = ['merchant_idx', 'category_idx', 'user_idx', 'tax_type_idx',
-                        'company_type_idx', 'company_size_idx',
-                        'merchant_id', 'category_id', 'user_id', 'txn_id', 
-                        'accepted_category_id', 'presented_category_id', 
-                        'accepted_tax_account_type', 'presented_tax_account_type',
-                        'company_type', 'company_size']
-        
-        numerical_cols = [col for col in transactions_df.columns 
-                         if transactions_df[col].dtype in ['int64', 'float64'] 
-                         and col not in exclude_cols]
-        
-        # Handle specific required fields
-        required_features = []
-        
-        # Add is_new_user as a feature if available
-        if 'is_new_user' in transactions_df.columns:
-            required_features.append('is_new_user')
-            
-        # Add confidence score if available
-        if 'conf_score' in transactions_df.columns:
-            required_features.append('conf_score')
-        
-        # Make sure required features are included
-        for feat in required_features:
-            if feat in numerical_cols:
-                continue
-            if feat in transactions_df.columns:
-                numerical_cols.append(feat)
-        
-        # If no numerical columns, create a dummy feature
-        if not numerical_cols:
-            transactions_df['dummy_feature'] = 1.0
-            numerical_cols = ['dummy_feature']
-            
-        # Normalize numerical features
-        scaler = StandardScaler()
-        transaction_num_features = scaler.fit_transform(transactions_df[numerical_cols])
-        
-        # One-hot encode categorical features
-        categorical_cols = [col for col in transactions_df.columns 
-                           if transactions_df[col].dtype == 'object' 
-                           and col not in exclude_cols + ['merchant_id', 'category_id', 'user_id', 'txn_id']]
-        
-        # Process model_provider and model_version if available
-        if 'model_provider' in transactions_df.columns and 'model_provider' not in categorical_cols:
-            categorical_cols.append('model_provider')
-            
-        if 'model_version' in transactions_df.columns and 'model_version' not in categorical_cols:
-            categorical_cols.append('model_version')
-        
-        # Process categorical features
-        if categorical_cols:
-            # Convert all categorical columns to strings to ensure consistent data types for encoder
-            categorical_df = transactions_df[categorical_cols].copy()
-            for col in categorical_cols:
-                categorical_df[col] = categorical_df[col].astype(str)
-                
-            encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-            transaction_cat_features = encoder.fit_transform(categorical_df)
-            
-            # Combine numerical and categorical features
-            transaction_features = np.hstack([transaction_num_features, transaction_cat_features])
-        else:
-            transaction_features = transaction_num_features
-        
-        # Create merchant features (aggregated transaction stats per merchant)
-        merchant_features = self._create_merchant_features(transactions_df)
-        
-        # Create user features if user_id is available
-        if 'user_id' in transactions_df.columns:
-            user_features = self._create_user_features(transactions_df)
-        else:
-            # Create dummy user features
-            num_users = len(self.user_mapping) if self.user_mapping else 1
-            user_features = np.zeros((num_users, 1))
-            
-        # Create company features if available - check for any company-related columns
-        company_features = None
-        company_cols = ['company_id', 'company_name', 'industry_name', 'industry_code', 
-                        'qbo_current_product', 'qbo_signup_type_desc', 'region_id', 'language_id',
-                        'company_type', 'company_size']
-        
-        found_cols = [col for col in company_cols if col in transactions_df.columns]
-        if found_cols:
-            print(f"Found company-related columns: {', '.join(found_cols)}")
-            company_features = self._create_company_features(transactions_df)
-        else:
-            print("No company features available in the graph")
-        
-        # Convert to PyTorch tensors
-        self.transaction_features = torch.FloatTensor(transaction_features)
-        self.merchant_features = torch.FloatTensor(merchant_features)
-        self.user_features = torch.FloatTensor(user_features)
-        
-        if company_features is not None:
-            self.company_features = torch.FloatTensor(company_features)
-        
-        return self.transaction_features, self.merchant_features, self.user_features, self.company_features
-        
-    def _create_user_features(self, transactions_df: pd.DataFrame) -> np.ndarray:
-        """
-        Create features for user nodes by aggregating transaction data.
-        
-        Args:
-            transactions_df: Preprocessed transaction DataFrame
-            
-        Returns:
-            User features as numpy array
-        """
-        # Get list of possible aggregation columns
-        potential_agg_cols = [col for col in transactions_df.columns 
-                             if transactions_df[col].dtype in ['int64', 'float64'] 
-                             and col not in ['user_idx', 'merchant_idx', 'category_idx', 'tax_type_idx']]
-        
-        # Define actual aggregation columns (use what's available)
-        agg_cols = []
-        for col in ['conf_score', 'is_new_user']:
-            if col in potential_agg_cols:
-                agg_cols.append(col)
-                
-        # If no columns to aggregate, add a dummy column
-        if not agg_cols:
-            transactions_df['dummy_user_col'] = 1
-            agg_cols = ['dummy_user_col']
-        
-        # Group by user and compute aggregated statistics
-        agg_dict = {col: ['mean', 'count'] for col in agg_cols}
-        user_stats = transactions_df.groupby('user_idx').agg(agg_dict)
-        
-        # Flatten multi-index columns
-        user_stats.columns = ['_'.join(col).strip() for col in user_stats.columns.values]
-        
-        # Fill NaN values with 0
-        user_stats.fillna(0, inplace=True)
-        
-        # Add transaction count per user
-        user_stats['txn_count'] = transactions_df.groupby('user_idx').size()
-        
-        # Handle empty user_stats (if it happens)
-        if len(user_stats) == 0:
-            num_users = len(self.user_mapping) if self.user_mapping else 1
-            return np.zeros((num_users, 1))
-        
-        # Normalize user features if we have more than 1 feature
-        if user_stats.shape[1] > 1:
-            scaler = StandardScaler()
-            user_features = scaler.fit_transform(user_stats)
-        else:
-            user_features = user_stats.values
-            
-        return user_features
-    
-    def _create_company_features(self, transactions_df: pd.DataFrame) -> np.ndarray:
-        """
-        Create features for company entities based on company metadata.
-        
-        Args:
-            transactions_df: Preprocessed transaction DataFrame
-            
-        Returns:
-            Company features as numpy array
-        """
-        # Get company metadata features
-        company_features = []
-        
-        # Process company type if available (one-hot encode)
-        if 'company_type_idx' in transactions_df.columns:
-            unique_company_types = len(self.company_type_mapping) if self.company_type_mapping else 1
-            company_type_features = np.eye(unique_company_types)[transactions_df['company_type_idx'].values]
-            company_features.append(company_type_features)
-        
-        # Process company size if available (one-hot encode)
-        if 'company_size_idx' in transactions_df.columns:
-            unique_company_sizes = len(self.company_size_mapping) if self.company_size_mapping else 1
-            company_size_features = np.eye(unique_company_sizes)[transactions_df['company_size_idx'].values]
-            company_features.append(company_size_features)
-        
-        # Process QBO-specific data
-        qbo_status_features = []
-        
-        # QBO signup variables
-        qbo_numeric_cols = [
-            col for col in transactions_df.columns 
-            if col in ['qbo_signup_date', 'qbo_gns_date'] and
-            transactions_df[col].dtype != 'object'
-        ]
-        
-        if qbo_numeric_cols:
-            # Convert dates to days since epoch if they're date objects
-            for col in ['qbo_signup_date', 'qbo_gns_date']:
-                if col in transactions_df.columns and transactions_df[col].dtype == 'object':
-                    try:
-                        transactions_df[f'{col}_days'] = pd.to_datetime(transactions_df[col]).dt.days
-                        qbo_numeric_cols.append(f'{col}_days')
-                    except:
-                        pass
-            
-            # Normalize QBO numeric features
-            scaler = StandardScaler()
-            qbo_numeric_features = scaler.fit_transform(transactions_df[qbo_numeric_cols])
-            qbo_status_features.append(qbo_numeric_features)
-        
-        # Categorical QBO features
-        for col in ['qbo_signup_type_desc', 'qbo_current_product']:
-            if col in transactions_df.columns:
-                # Convert to string to ensure consistent type
-                transactions_df[col] = transactions_df[col].astype(str)
-                
-                # Create mapping if not exists
-                if not hasattr(self, f'{col}_mapping'):
-                    unique_values = transactions_df[col].unique()
-                    setattr(self, f'{col}_mapping', {v: i for i, v in enumerate(unique_values)})
-                
-                # Get mapping
-                col_mapping = getattr(self, f'{col}_mapping')
-                
-                # One-hot encode with safe mapping that handles possible missing keys
-                transactions_df[f'{col}_idx'] = transactions_df[col].map(lambda x: col_mapping.get(x, 0))
-                unique_values = len(col_mapping)
-                col_features = np.eye(unique_values)[transactions_df[f'{col}_idx'].values]
-                qbo_status_features.append(col_features)
-        
-        # Binary QBO features
-        binary_cols = [
-            'qbo_accountant_attached_current_flag', 
-            'qbo_accountant_attached_ever',
-            'qblive_attach_flag',
-            'is_before_cutoff_date'
-        ]
-        
-        for col in binary_cols:
-            if col in transactions_df.columns:
-                # Convert to binary
-                try:
-                    binary_feature = transactions_df[col].astype(float).values.reshape(-1, 1)
-                    qbo_status_features.append(binary_feature)
-                except:
-                    # If conversion fails, try to handle as boolean or string
-                    if transactions_df[col].dtype == 'bool':
-                        binary_feature = transactions_df[col].astype(int).values.reshape(-1, 1)
-                        qbo_status_features.append(binary_feature)
-                    elif transactions_df[col].dtype == 'object':
-                        # Try to convert common string representations of boolean
-                        try:
-                            bool_map = {'true': 1, 'false': 0, 'yes': 1, 'no': 0, 'y': 1, 'n': 0, 't': 1, 'f': 0}
-                            binary_feature = transactions_df[col].str.lower().map(bool_map).fillna(0).values.reshape(-1, 1)
-                            qbo_status_features.append(binary_feature)
-                        except:
-                            print(f"Could not convert column {col} to binary feature")
-        
-        # Add QBO status features if any
-        if qbo_status_features:
-            combined_qbo = np.hstack(qbo_status_features)
-            company_features.append(combined_qbo)
-        
-        # Process industry data
-        industry_features = []
-        
-        # One-hot encode industry info if available
-        if 'industry_code' in transactions_df.columns:
-            # Convert to string to ensure consistent type
-            transactions_df['industry_code'] = transactions_df['industry_code'].astype(str)
-            
-            # Create mapping if not exists
-            if not hasattr(self, 'industry_code_mapping'):
-                unique_industries = transactions_df['industry_code'].unique()
-                self.industry_code_mapping = {v: i for i, v in enumerate(unique_industries)}
-            
-            # One-hot encode with safe mapping
-            transactions_df['industry_code_idx'] = transactions_df['industry_code'].map(
-                lambda x: self.industry_code_mapping.get(x, 0)
-            )
-            unique_industries = len(self.industry_code_mapping)
-            industry_code_features = np.eye(unique_industries)[transactions_df['industry_code_idx'].values]
-            industry_features.append(industry_code_features)
-        
-        # Process region and language data
-        if 'region_id' in transactions_df.columns:
-            # Convert to string to ensure consistent type
-            transactions_df['region_id'] = transactions_df['region_id'].astype(str)
-            
-            # Create mapping if not exists
-            if not hasattr(self, 'region_mapping'):
-                unique_regions = transactions_df['region_id'].unique()
-                self.region_mapping = {v: i for i, v in enumerate(unique_regions)}
-            
-            # One-hot encode with safe mapping
-            transactions_df['region_idx'] = transactions_df['region_id'].map(
-                lambda x: self.region_mapping.get(x, 0)
-            )
-            unique_regions = len(self.region_mapping)
-            region_features = np.eye(unique_regions)[transactions_df['region_idx'].values]
-            industry_features.append(region_features)
-        
-        if 'language_id' in transactions_df.columns:
-            # Convert to string to ensure consistent type
-            transactions_df['language_id'] = transactions_df['language_id'].astype(str)
-            
-            # Create mapping if not exists
-            if not hasattr(self, 'language_mapping'):
-                unique_languages = transactions_df['language_id'].unique()
-                self.language_mapping = {v: i for i, v in enumerate(unique_languages)}
-            
-            # One-hot encode with safe mapping
-            transactions_df['language_idx'] = transactions_df['language_id'].map(
-                lambda x: self.language_mapping.get(x, 0)
-            )
-            unique_languages = len(self.language_mapping)
-            language_features = np.eye(unique_languages)[transactions_df['language_idx'].values]
-            industry_features.append(language_features)
-            
-        # Add industry features if any
-        if industry_features:
-            combined_industry = np.hstack(industry_features)
-            company_features.append(combined_industry)
-            
-        # Add any additional company features that might be available
-        additional_company_features = [
-            col for col in transactions_df.columns
-            if (col.startswith('company_') and 
-               col not in ['company_type', 'company_size', 'company_type_idx', 'company_size_idx', 'company_id', 'company_name']) and
-            transactions_df[col].dtype in ['int64', 'float64']
-        ]
-        
-        if additional_company_features:
-            # Normalize additional numerical features
-            scaler = StandardScaler()
-            additional_features = scaler.fit_transform(transactions_df[additional_company_features])
-            company_features.append(additional_features)
-        
-        # Combine all company features
-        if company_features:
-            print(f"Combining {len(company_features)} company feature sets")
-            # Check all features for valid shapes
-            valid_features = []
-            for i, feat in enumerate(company_features):
-                if feat.shape[0] == len(transactions_df):
-                    valid_features.append(feat)
-                else:
-                    print(f"Warning: Feature set {i} has wrong shape {feat.shape}, expected first dim {len(transactions_df)}")
-                    
-            if valid_features:
-                combined_features = np.hstack(valid_features)
-                print(f"Created combined company features with shape {combined_features.shape}")
-            else:
-                print("No valid company features found, creating dummy features")
-                combined_features = np.zeros((len(transactions_df), 1))
-        else:
-            # Create dummy features if no company data is available
-            print("No company feature sets found, creating dummy features")
-            combined_features = np.zeros((len(transactions_df), 1))
-            
-        return combined_features
-        
-    def _create_merchant_features(self, transactions_df: pd.DataFrame) -> np.ndarray:
-        """
-        Create features for merchant nodes by aggregating transaction data.
-        
-        Args:
-            transactions_df: Preprocessed transaction DataFrame
-            
-        Returns:
-            Merchant features as numpy array
-        """
-        # Group by merchant and compute aggregated statistics
-        merchant_stats = transactions_df.groupby('merchant_idx').agg({
-            'amount': ['mean', 'std', 'min', 'max', 'count'],
-            # Add more aggregations as needed
-        })
-        
-        # Flatten multi-index columns
-        merchant_stats.columns = ['_'.join(col).strip() for col in merchant_stats.columns.values]
-        
-        # Add company-related features to merchant features if available
-        if 'company_type_idx' in transactions_df.columns:
-            # Get most common company type per merchant
-            merchant_company_type = transactions_df.groupby('merchant_idx')['company_type_idx'].agg(
-                lambda x: x.value_counts().index[0] if len(x) > 0 else 0
-            )
-            merchant_stats['company_type_idx'] = merchant_company_type
-            
-        if 'company_size_idx' in transactions_df.columns:
-            # Get most common company size per merchant
-            merchant_company_size = transactions_df.groupby('merchant_idx')['company_size_idx'].agg(
-                lambda x: x.value_counts().index[0] if len(x) > 0 else 0
-            )
-            merchant_stats['company_size_idx'] = merchant_company_size
-        
-        # Fill NaN values with 0
-        merchant_stats.fillna(0, inplace=True)
-        
-        # Normalize merchant features
-        scaler = StandardScaler()
-        merchant_features = scaler.fit_transform(merchant_stats)
-        
-        return merchant_features
-    
-    def build_graph(self, transactions_df: pd.DataFrame) -> HeteroData:
-        """
-        Build a heterogeneous graph from transaction data.
-        
-        Modified to include user nodes, company metadata, and support dual classification targets
-        (category and tax account type).
-        
-        Args:
-            transactions_df: DataFrame containing transaction data
-            
-        Returns:
-            PyTorch Geometric HeteroData object representing the transaction graph
-        """
-        # Preprocess transactions
-        processed_df = self.preprocess_transactions(transactions_df)
-        
-        # Extract features
-        transaction_features, merchant_features, user_features, company_features = self.extract_features(processed_df)
-        
-        # Create heterogeneous graph
-        graph = HeteroData()
-        
-        # Add node features
-        graph['transaction'].x = transaction_features
-        graph['merchant'].x = merchant_features
-        graph['user'].x = user_features
-        
-        # Add company nodes if available - using a broader condition
-        company_cols = ['company_id', 'company_name', 'industry_name', 'industry_code', 
-                        'qbo_current_product', 'qbo_signup_type_desc', 'region_id', 'language_id',
-                        'company_type', 'company_size']
-        has_company_data = any(col in processed_df.columns for col in company_cols)
-        
-        if company_features is not None:
-            print(f"Adding company features of shape {company_features.shape} to graph")
-            graph['company'].x = company_features
-        else:
-            print("No company features to add to graph nodes")
-        
-        # Add category nodes (one-hot encoded)
-        num_categories = len(self.category_mapping)
-        graph['category'].x = torch.eye(num_categories)
-        
-        # Add tax account type nodes (one-hot encoded)
-        num_tax_types = len(self.tax_type_mapping)
-        graph['tax_type'].x = torch.eye(num_tax_types)
-        
-        # Create transaction indices
-        src_nodes = torch.tensor(range(len(processed_df)), dtype=torch.long)
-        
-        # Add edges: transaction -> merchant
-        dst_nodes = torch.tensor(processed_df['merchant_idx'].values, dtype=torch.long)
-        graph['transaction', 'belongs_to', 'merchant'].edge_index = torch.stack([src_nodes, dst_nodes])
-        
-        # Add edges: transaction -> category
-        dst_nodes = torch.tensor(processed_df['category_idx'].values, dtype=torch.long)
-        graph['transaction', 'has_category', 'category'].edge_index = torch.stack([src_nodes, dst_nodes])
-        
-        # Add edges: transaction -> tax_type
-        dst_nodes = torch.tensor(processed_df['tax_type_idx'].values, dtype=torch.long)
-        graph['transaction', 'has_tax_type', 'tax_type'].edge_index = torch.stack([src_nodes, dst_nodes])
-        
-        # Add edges: transaction -> user
-        dst_nodes = torch.tensor(processed_df['user_idx'].values, dtype=torch.long)
-        graph['transaction', 'made_by', 'user'].edge_index = torch.stack([src_nodes, dst_nodes])
-        
-        # Add edges for company data if available
-        if has_company_data and company_features is not None:
-            # For now, each transaction can be linked to the company node with the same index
-            # This is a simplification; in a real implementation, you might need a more complex mapping
-            print("Creating company-transaction edges")
-            dst_nodes = torch.tensor(range(len(processed_df)), dtype=torch.long)
-            graph['transaction', 'from_company', 'company'].edge_index = torch.stack([src_nodes, dst_nodes])
-            
-            # Add reverse edges for bidirectional message passing
-            graph['company', 'has_transaction', 'transaction'].edge_index = torch.stack([dst_nodes, src_nodes])
-        
-        # Add reverse edges for bidirectional message passing
-        # user -> transaction edges
-        src_nodes = torch.tensor(processed_df['user_idx'].values, dtype=torch.long)
-        dst_nodes = torch.tensor(range(len(processed_df)), dtype=torch.long)
-        graph['user', 'makes', 'transaction'].edge_index = torch.stack([src_nodes, dst_nodes])
-        
-        # Add primary labels for transactions (category)
-        graph['transaction'].y_category = torch.tensor(processed_df['category_idx'].values, dtype=torch.long)
-        
-        # Add secondary labels (tax account type)
-        graph['transaction'].y_tax_type = torch.tensor(processed_df['tax_type_idx'].values, dtype=torch.long)
-        
-        # Store original IDs for reference
-        if 'txn_id' in processed_df.columns:
-            # Handle string or object dtype by storing as a list attribute
-            if processed_df['txn_id'].dtype == 'object':
-                graph['transaction'].txn_id_list = processed_df['txn_id'].tolist()
-            else:
-                # For numeric IDs, use tensor
-                graph['transaction'].txn_id = torch.tensor(processed_df['txn_id'].values)
-            
-        if 'user_id' in processed_df.columns:
-            # Handle different types of user_id
-            if processed_df['user_id'].dtype == 'object':
-                graph['user'].user_id_list = processed_df['user_id'].tolist()
-            else:
-                graph['user'].user_id = torch.tensor(processed_df['user_id'].values)
-            
-        # Add business metadata as node attributes
-        if 'company_type' in processed_df.columns:
-            graph['company'].company_type = torch.tensor(
-                processed_df['company_type_idx'].values if 'company_type_idx' in processed_df.columns else []
-            )
-            
-        if 'company_size' in processed_df.columns:
-            graph['company'].company_size = torch.tensor(
-                processed_df['company_size_idx'].values if 'company_size_idx' in processed_df.columns else []
-            )
-            
-        # Add is_new_user as a separate node attribute if available
-        if 'is_new_user' in processed_df.columns:
-            graph['user'].is_new_user = torch.tensor(processed_df.groupby('user_idx')['is_new_user'].first().values)
-        
-        return graph
-    
-    def save_graph(self, graph: HeteroData, output_path: str) -> None:
-        """
-        Save the graph to disk.
-        
-        Args:
-            graph: PyTorch Geometric HeteroData object
-            output_path: Path to save the graph
-        """
-        torch.save(graph, output_path)
-    
-    def load_graph(self, input_path: str) -> HeteroData:
-        """
-        Load a graph from disk.
-        
-        Args:
-            input_path: Path to the saved graph
-            
-        Returns:
-            PyTorch Geometric HeteroData object
-        """
-        return torch.load(input_path)
+from typing import Dict, List, Tuple, Optional, Union
+import random
 
 
-def create_train_val_test_split(graph: HeteroData, train_ratio: float = 0.7, 
-                               val_ratio: float = 0.15, 
-                               group_by_user: bool = True) -> HeteroData:
+def build_transaction_relationship_graph(df: pd.DataFrame) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Split a graph into training, validation, and test sets.
-    
-    Modified to support user-based splitting to prevent data leakage.
+    Build a comprehensive transaction graph with multiple relationship types:
+    - Company relationships (transactions from same company)
+    - Merchant relationships (transactions with same merchant)
+    - Industry relationships (transactions in same industry)
+    - Price similarity relationships (transactions with similar amounts)
+    - Temporal relationships (sequential transactions from same company)
     
     Args:
-        graph: PyTorch Geometric HeteroData object
-        train_ratio: Ratio of training data
-        val_ratio: Ratio of validation data
-        group_by_user: Whether to ensure all transactions from the same user 
-                      stay in the same split (prevents data leakage)
+        df: DataFrame containing transaction data with columns:
+            - company_id: Company identifier
+            - merchant_id: Merchant identifier
+            - industry_code: (Optional) Industry code
+            - amount: (Optional) Transaction amount
+            - timestamp: Transaction timestamp
+            
+    Returns:
+        edge_index: Tensor of shape [2, num_edges] containing edge indices
+        edge_attr: Tensor of shape [num_edges, 1] containing edge weights
+        edge_type: Tensor of shape [num_edges] containing edge type identifiers
+            0: company relationship
+            1: merchant relationship
+            2: industry relationship
+            3: price relationship
+            4: temporal relationship
+    """
+    edges = []
+    edge_attrs = []
+    edge_types = []  # To track the type of each relationship
+    
+    # 1. Create edges between transactions from the same company
+    if 'company_id' in df.columns:
+        company_groups = df.groupby('company_id')
+        for company_id, group in company_groups:
+            txn_indices = group.index.tolist()
+            
+            # If too many transactions, sample pairs to avoid creating too many edges
+            if len(txn_indices) > 50:
+                # Select random pairs with a cap
+                num_pairs = min(1000, len(txn_indices) * 5)
+                random.seed(42)  # For reproducibility
+                pairs = [(txn_indices[i], txn_indices[j]) 
+                        for i in range(len(txn_indices)) 
+                        for j in range(i+1, len(txn_indices))]
+                
+                if len(pairs) > num_pairs:
+                    pairs = random.sample(pairs, num_pairs)
+                
+                for src, dst in pairs:
+                    edges.append((src, dst))
+                    
+                    # Add edge weight based on time difference if timestamp exists
+                    if 'timestamp' in group.columns:
+                        try:
+                            time_diff = abs((group.loc[src, 'timestamp'] - group.loc[dst, 'timestamp']).total_seconds())
+                            similarity = 1.0 / (1.0 + time_diff/86400)  # Normalize by day
+                        except:
+                            similarity = 0.7  # Default if timestamp comparison fails
+                    else:
+                        similarity = 0.7  # Default company relationship strength
+                        
+                    edge_attrs.append([similarity])
+                    edge_types.append(0)  # 0 = company relationship
+            else:
+                # If few transactions, create edges between all pairs
+                for i in range(len(txn_indices)):
+                    for j in range(i+1, len(txn_indices)):
+                        src, dst = txn_indices[i], txn_indices[j]
+                        edges.append((src, dst))
+                        
+                        # Add edge weight based on time difference if timestamp exists
+                        if 'timestamp' in group.columns:
+                            try:
+                                time_diff = abs((group.loc[src, 'timestamp'] - group.loc[dst, 'timestamp']).total_seconds())
+                                similarity = 1.0 / (1.0 + time_diff/86400)  # Normalize by day
+                            except:
+                                similarity = 0.7  # Default if timestamp comparison fails
+                        else:
+                            similarity = 0.7  # Default company relationship strength
+                            
+                        edge_attrs.append([similarity])
+                        edge_types.append(0)  # 0 = company relationship
+    
+    # 2. Create edges between transactions with the same merchant
+    if 'merchant_id' in df.columns:
+        merchant_groups = df.groupby('merchant_id')
+        for merchant_id, group in merchant_groups:
+            txn_indices = group.index.tolist()
+            
+            # If too many transactions with same merchant, sample
+            if len(txn_indices) > 50:
+                # Select random pairs with a cap
+                num_pairs = min(1000, len(txn_indices) * 5)
+                random.seed(43)  # Different seed from company relationships
+                pairs = [(txn_indices[i], txn_indices[j]) 
+                        for i in range(len(txn_indices)) 
+                        for j in range(i+1, len(txn_indices))]
+                
+                if len(pairs) > num_pairs:
+                    pairs = random.sample(pairs, num_pairs)
+                
+                for src, dst in pairs:
+                    edges.append((src, dst))
+                    edge_attrs.append([0.85])  # Merchant relationships are strong
+                    edge_types.append(1)  # 1 = merchant relationship
+            else:
+                # If few transactions, create edges between all pairs
+                for i in range(len(txn_indices)):
+                    for j in range(i+1, len(txn_indices)):
+                        edges.append((txn_indices[i], txn_indices[j]))
+                        edge_attrs.append([0.85])  # Merchant relationships are strong
+                        edge_types.append(1)  # 1 = merchant relationship
+    
+    # 3. Create edges between transactions from the same industry
+    if 'industry_code' in df.columns:
+        industry_groups = df.groupby('industry_code')
+        for industry_code, group in industry_groups:
+            txn_indices = group.index.tolist()
+            
+            # For large industries, limit connections
+            if len(txn_indices) > 100:
+                # Sample connections randomly - fewer than company/merchant
+                num_pairs = min(500, len(txn_indices) * 2)
+                random.seed(44)  # Different seed
+                pairs = [(txn_indices[i], txn_indices[j]) 
+                        for i in range(len(txn_indices)) 
+                        for j in range(i+1, len(txn_indices))]
+                
+                if len(pairs) > num_pairs:
+                    pairs = random.sample(pairs, num_pairs)
+                
+                for src, dst in pairs:
+                    edges.append((src, dst))
+                    edge_attrs.append([0.6])  # Industry connections have lower weight
+                    edge_types.append(2)  # 2 = industry relationship
+            elif len(txn_indices) > 10:
+                # Medium-sized industry groups
+                for i in range(len(txn_indices)):
+                    # Connect to a subset of other transactions
+                    for j in range(i+1, min(i+20, len(txn_indices))):
+                        edges.append((txn_indices[i], txn_indices[j]))
+                        edge_attrs.append([0.6])  # Industry connections have lower weight
+                        edge_types.append(2)  # 2 = industry relationship
+            else:
+                # Small industry groups - connect all
+                for i in range(len(txn_indices)):
+                    for j in range(i+1, len(txn_indices)):
+                        edges.append((txn_indices[i], txn_indices[j]))
+                        edge_attrs.append([0.6])  # Industry connections have lower weight
+                        edge_types.append(2)  # 2 = industry relationship
+    
+    # 4. Create edges based on price similarity
+    if 'amount' in df.columns:
+        try:
+            # Get the amount values
+            amounts = df['amount'].values
+            
+            # Normalize the amounts for binning
+            min_amount = np.min(amounts)
+            max_amount = np.max(amounts)
+            if max_amount > min_amount:  # Avoid division by zero
+                normalized_amounts = (amounts - min_amount) / (max_amount - min_amount)
+                
+                # Group transactions into amount bins (e.g., 10 bins)
+                num_bins = 10
+                amount_bins = np.digitize(normalized_amounts, bins=np.linspace(0, 1, num_bins))
+                
+                # Create edges between transactions in the same price bin
+                for bin_idx in range(1, num_bins + 1):
+                    bin_indices = np.where(amount_bins == bin_idx)[0]
+                    
+                    # Skip empty bins
+                    if len(bin_indices) <= 1:
+                        continue
+                    
+                    # If too many transactions in same bin, sample
+                    if len(bin_indices) > 50:
+                        # Sample a limited number of pairs
+                        num_pairs = min(300, len(bin_indices) * 2)
+                        random.seed(45)  # Different seed
+                        
+                        # Create all possible pairs
+                        pairs = [(i, j) for i in range(len(bin_indices)) for j in range(i+1, len(bin_indices))]
+                        
+                        # Sample if too many
+                        if len(pairs) > num_pairs:
+                            pairs = random.sample(pairs, num_pairs)
+                        
+                        for i, j in pairs:
+                            idx1, idx2 = bin_indices[i], bin_indices[j]
+                            edges.append((idx1, idx2))
+                            
+                            # Weight based on actual amount similarity
+                            amount_sim = 1.0 - abs(normalized_amounts[idx1] - normalized_amounts[idx2])
+                            edge_attrs.append([amount_sim * 0.7])  # Amount edges have 0.7 max weight
+                            edge_types.append(3)  # 3 = price relationship
+                    else:
+                        for i in range(len(bin_indices)):
+                            for j in range(i+1, len(bin_indices)):
+                                idx1, idx2 = bin_indices[i], bin_indices[j]
+                                edges.append((idx1, idx2))
+                                
+                                # Weight based on actual amount similarity
+                                amount_sim = 1.0 - abs(normalized_amounts[idx1] - normalized_amounts[idx2])
+                                edge_attrs.append([amount_sim * 0.7])  # Amount edges have 0.7 max weight
+                                edge_types.append(3)  # 3 = price relationship
+        except Exception as e:
+            print(f"Error creating price similarity edges: {str(e)}")
+    
+    # 5. Create sequential transaction edges (temporal)
+    # Sort transactions by timestamp if available
+    if 'timestamp' in df.columns and 'company_id' in df.columns:
+        try:
+            sorted_df = df.sort_values('timestamp')
+            sorted_indices = sorted_df.index.tolist()
+            
+            for i in range(len(sorted_indices) - 1):
+                curr_idx = sorted_indices[i]
+                next_idx = sorted_indices[i + 1]
+                
+                # Only connect sequential transactions within the same company
+                if sorted_df.loc[curr_idx, 'company_id'] == sorted_df.loc[next_idx, 'company_id']:
+                    edges.append((curr_idx, next_idx))
+                    
+                    # Weight based on time difference
+                    time_diff = (sorted_df.loc[next_idx, 'timestamp'] - sorted_df.loc[curr_idx, 'timestamp']).total_seconds()
+                    
+                    # Stronger weight for transactions closer in time (max 0.95, min 0.1)
+                    weight = max(0.1, min(0.95, 86400 / (time_diff + 3600)))  # 86400 = seconds in a day
+                    edge_attrs.append([weight])
+                    edge_types.append(4)  # 4 = temporal relationship
+        except Exception as e:
+            print(f"Error creating temporal edges: {str(e)}")
+    
+    # Convert to tensors if we have any edges
+    if edges:
+        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+        edge_attr = torch.tensor(edge_attrs, dtype=torch.float)
+        edge_type = torch.tensor(edge_types, dtype=torch.long)
+        
+        return edge_index, edge_attr, edge_type
+    else:
+        # Return empty tensors if no edges
+        return (torch.empty((2, 0), dtype=torch.long), 
+                torch.empty((0, 1), dtype=torch.float), 
+                torch.empty(0, dtype=torch.long))
+
+
+def extract_graph_features(df: pd.DataFrame) -> torch.Tensor:
+    """
+    Extract graph node features from transaction data.
+    
+    Args:
+        df: DataFrame containing transaction data
         
     Returns:
-        Graph with train/val/test masks added
+        node_features: Tensor of node features [num_nodes, num_features]
     """
-    num_transactions = graph['transaction'].x.size(0)
+    features = []
     
-    if group_by_user and 'user' in graph.node_types and hasattr(graph['transaction'], 'made_by'):
-        # Get user IDs for each transaction
-        src_indices = torch.arange(num_transactions)
-        user_indices = graph['transaction', 'made_by', 'user'].edge_index[1]
+    # 1. Amount features (if available)
+    if 'amount' in df.columns:
+        # Raw amount (normalized)
+        amounts = df['amount'].values
+        normalized_amounts = (amounts - np.mean(amounts)) / (np.std(amounts) + 1e-8)
+        features.append(torch.tensor(normalized_amounts, dtype=torch.float).unsqueeze(1))
         
-        # Group transactions by user
-        user_to_txn = {}
-        for txn_idx, user_idx in zip(src_indices.tolist(), user_indices.tolist()):
-            if user_idx not in user_to_txn:
-                user_to_txn[user_idx] = []
-            user_to_txn[user_idx].append(txn_idx)
-        
-        # Split users
-        num_users = len(user_to_txn)
-        user_indices = torch.randperm(num_users).tolist()
-        
-        train_size = int(train_ratio * num_users)
-        val_size = int(val_ratio * num_users)
-        
-        train_user_indices = user_indices[:train_size]
-        val_user_indices = user_indices[train_size:train_size + val_size]
-        test_user_indices = user_indices[train_size + val_size:]
-        
-        # Assign transactions to splits based on user
-        train_indices = []
-        for user_idx in train_user_indices:
-            if user_idx in user_to_txn:
-                train_indices.extend(user_to_txn[user_idx])
+        # Log amount (helps with skewed distributions)
+        log_amounts = np.log1p(np.abs(amounts))
+        normalized_log_amounts = (log_amounts - np.mean(log_amounts)) / (np.std(log_amounts) + 1e-8)
+        features.append(torch.tensor(normalized_log_amounts, dtype=torch.float).unsqueeze(1))
+    
+    # 2. Temporal features (if available)
+    if 'timestamp' in df.columns:
+        try:
+            # Convert to datetime if not already
+            if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
+                timestamps = pd.to_datetime(df['timestamp'])
+            else:
+                timestamps = df['timestamp']
+            
+            # Hour of day (cyclical encoding)
+            hours = timestamps.dt.hour.values
+            hour_sin = np.sin(2 * np.pi * hours / 24)
+            hour_cos = np.cos(2 * np.pi * hours / 24)
+            features.append(torch.tensor(hour_sin, dtype=torch.float).unsqueeze(1))
+            features.append(torch.tensor(hour_cos, dtype=torch.float).unsqueeze(1))
+            
+            # Day of week (cyclical encoding)
+            days = timestamps.dt.dayofweek.values
+            day_sin = np.sin(2 * np.pi * days / 7)
+            day_cos = np.cos(2 * np.pi * days / 7)
+            features.append(torch.tensor(day_sin, dtype=torch.float).unsqueeze(1))
+            features.append(torch.tensor(day_cos, dtype=torch.float).unsqueeze(1))
+            
+            # Month (cyclical encoding)
+            months = timestamps.dt.month.values
+            month_sin = np.sin(2 * np.pi * months / 12)
+            month_cos = np.cos(2 * np.pi * months / 12)
+            features.append(torch.tensor(month_sin, dtype=torch.float).unsqueeze(1))
+            features.append(torch.tensor(month_cos, dtype=torch.float).unsqueeze(1))
+            
+            # Is weekend
+            is_weekend = (days >= 5).astype(float)
+            features.append(torch.tensor(is_weekend, dtype=torch.float).unsqueeze(1))
+        except Exception as e:
+            print(f"Error extracting temporal features: {str(e)}")
+    
+    # 3. Categorical features (one-hot encoded)
+    categorical_cols = ['merchant_id', 'company_id', 'industry_code']
+    for col in categorical_cols:
+        if col in df.columns:
+            try:
+                # Get unique values and create mapping
+                unique_values = df[col].unique()
+                value_to_idx = {val: idx for idx, val in enumerate(unique_values)}
                 
-        val_indices = []
-        for user_idx in val_user_indices:
-            if user_idx in user_to_txn:
-                val_indices.extend(user_to_txn[user_idx])
+                # Convert to indices
+                indices = df[col].map(value_to_idx).values
                 
-        test_indices = []
-        for user_idx in test_user_indices:
-            if user_idx in user_to_txn:
-                test_indices.extend(user_to_txn[user_idx])
+                # One-hot encode (for smaller cardinality features)
+                if len(unique_values) <= 100:
+                    one_hot = np.eye(len(unique_values))[indices]
+                    features.append(torch.tensor(one_hot, dtype=torch.float))
+                else:
+                    # For high cardinality features, use the index directly
+                    # and an embedding will be learned during training
+                    indices_tensor = torch.tensor(indices, dtype=torch.long).unsqueeze(1)
+                    features.append(indices_tensor.float())
+            except Exception as e:
+                print(f"Error extracting {col} features: {str(e)}")
+    
+    # Concatenate all features
+    if features:
+        return torch.cat(features, dim=1)
     else:
-        # If not grouping by user or user data is not available, use random split
-        indices = torch.randperm(num_transactions).tolist()
-        
-        train_size = int(train_ratio * num_transactions)
-        val_size = int(val_ratio * num_transactions)
-        
-        train_indices = indices[:train_size]
-        val_indices = indices[train_size:train_size + val_size]
-        test_indices = indices[train_size + val_size:]
-    
-    # Create masks
-    train_mask = torch.zeros(num_transactions, dtype=torch.bool)
-    val_mask = torch.zeros(num_transactions, dtype=torch.bool)
-    test_mask = torch.zeros(num_transactions, dtype=torch.bool)
-    
-    train_mask[train_indices] = True
-    val_mask[val_indices] = True
-    test_mask[test_indices] = True
-    
-    # Add masks to graph
-    graph['transaction'].train_mask = train_mask
-    graph['transaction'].val_mask = val_mask
-    graph['transaction'].test_mask = test_mask
-    
-    return graph
+        # Return empty tensor if no features
+        return torch.empty((len(df), 0), dtype=torch.float)

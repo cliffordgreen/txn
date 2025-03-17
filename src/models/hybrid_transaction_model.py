@@ -5,6 +5,28 @@ from torch_geometric.nn import HeteroConv, GCNConv, SAGEConv, GATConv, Linear, J
 from torch_geometric.data import HeteroData
 from typing import Dict, List, Tuple, Optional, Union
 import numpy as np
+import pandas as pd
+
+# Import our custom models
+from src.models.hyper_temporal_model import (
+    HyperTemporalTransactionModel, 
+    DynamicContextualTemporal,
+    MultiModalFusion
+)
+
+try:
+    # Import graph model if available
+    from src.models.graph_enhanced_model import GraphEnhancedTemporalModel
+    HAS_GRAPH_MODEL = True
+except ImportError:
+    HAS_GRAPH_MODEL = False
+    
+# Import graph processing utilities
+try:
+    from src.data_processing.transaction_graph import build_transaction_relationship_graph
+    HAS_GRAPH_PROCESSING = True
+except ImportError:
+    HAS_GRAPH_PROCESSING = False
 
 class HybridTransactionModel(torch.nn.Module):
     """
@@ -422,3 +444,384 @@ class HybridTransactionEnsemble(torch.nn.Module):
             probs = F.softmax(logits, dim=1)
             
             return probs
+
+
+class EnhancedHybridTransactionModel(nn.Module):
+    """
+    Enhanced hybrid model that integrates:
+    1. Graph-based relationships (merchant, company, industry, and price)
+    2. Temporal patterns with company-based grouping
+    3. Hyperbolic encoding for hierarchical relationships
+    
+    This model combines the strengths of graph neural networks for capturing
+    relationship structures between transactions and temporal models for capturing
+    sequential patterns in transaction data.
+    """
+    
+    def __init__(self, input_dim: int, hidden_dim: int = 256, output_dim: int = 400,
+                 num_heads: int = 8, num_graph_layers: int = 2, num_temporal_layers: int = 2, 
+                 dropout: float = 0.2, use_hyperbolic: bool = True, use_neural_ode: bool = False,
+                 use_text: bool = False, multi_task: bool = True, tax_type_dim: int = 20,
+                 company_input_dim: Optional[int] = None, num_relations: int = 5,
+                 graph_weight: float = 0.6, temporal_weight: float = 0.4,
+                 use_dynamic_weighting: bool = True):
+        """
+        Initialize the enhanced hybrid transaction model.
+        
+        Args:
+            input_dim: Dimension of input node features
+            hidden_dim: Dimension of hidden features
+            output_dim: Dimension of output features (num categories)
+            num_heads: Number of attention heads
+            num_graph_layers: Number of graph layers
+            num_temporal_layers: Number of temporal layers
+            dropout: Dropout probability
+            use_hyperbolic: Whether to use hyperbolic encoding
+            use_neural_ode: Whether to use neural ODE layers
+            use_text: Whether to use text processing
+            multi_task: Whether to use multi-task learning
+            tax_type_dim: Dimension of tax type output
+            company_input_dim: Dimension of company input features
+            num_relations: Number of edge types in the graph
+            graph_weight: Weight for graph component in the ensemble
+            temporal_weight: Weight for temporal component in the ensemble
+            use_dynamic_weighting: Whether to learn the weights dynamically
+        """
+        super().__init__()
+        
+        if not HAS_GRAPH_MODEL:
+            raise ImportError("GraphEnhancedTemporalModel is required but not available")
+            
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.multi_task = multi_task
+        self.tax_type_dim = tax_type_dim
+        self.graph_weight = graph_weight
+        self.temporal_weight = temporal_weight
+        self.use_dynamic_weighting = use_dynamic_weighting
+        
+        # Normalize weights to sum to 1
+        total_weight = graph_weight + temporal_weight
+        self.graph_weight = graph_weight / total_weight
+        self.temporal_weight = temporal_weight / total_weight
+        
+        # Graph-enhanced model
+        self.graph_model = GraphEnhancedTemporalModel(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+            num_heads=num_heads,
+            num_graph_layers=num_graph_layers,
+            num_temporal_layers=num_temporal_layers,
+            dropout=dropout,
+            use_hyperbolic=use_hyperbolic,
+            use_neural_ode=use_neural_ode,
+            multi_task=multi_task,
+            tax_type_output_dim=tax_type_dim,
+            company_input_dim=company_input_dim,
+            num_relations=num_relations
+        )
+        
+        # Temporal model
+        self.temporal_model = HyperTemporalTransactionModel(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+            num_heads=num_heads,
+            num_layers=num_temporal_layers,
+            dropout=dropout,
+            use_hyperbolic=use_hyperbolic,
+            use_neural_ode=use_neural_ode,
+            use_text_processor=use_text,
+            graph_input_dim=hidden_dim,  # Set to hidden_dim since we'll use pre-processed features
+            company_input_dim=company_input_dim,
+            tax_type_output_dim=tax_type_dim,
+            multi_task=multi_task
+        )
+        
+        # Dynamic weighting module (if used)
+        if use_dynamic_weighting:
+            self.weight_module = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 2),  # 2 weights: graph and temporal
+                nn.Softmax(dim=1)
+            )
+            
+            # Feature extractors for weight calculation
+            self.graph_feature_extractor = nn.Linear(output_dim, hidden_dim)
+            self.temporal_feature_extractor = nn.Linear(output_dim, hidden_dim)
+        
+        # Output projections
+        self.category_output = nn.Linear(output_dim, output_dim)
+        if multi_task:
+            self.tax_type_output = nn.Linear(tax_type_dim, tax_type_dim)
+        
+    def forward(self, x, edge_index, edge_type, edge_attr, seq_features, 
+                timestamps, tabular_features, t0, t1, descriptions=None,
+                user_features=None, is_new_user=None, company_features=None,
+                company_ids=None, batch_size=None, seq_len=None):
+        """
+        Forward pass through the enhanced hybrid model.
+        
+        Args:
+            x: Node features [num_nodes, input_dim]
+            edge_index: Graph connectivity [2, num_edges]
+            edge_type: Edge type indices [num_edges]
+            edge_attr: Edge attributes [num_edges, 1]
+            seq_features: Sequential features [batch_size, seq_len, input_dim]
+            timestamps: Timestamps [batch_size, seq_len]
+            tabular_features: Tabular features [batch_size, input_dim]
+            t0: Start time for ODE integration
+            t1: End time for ODE integration
+            descriptions: List of transaction descriptions (optional)
+            user_features: User features (optional)
+            is_new_user: Boolean tensor for new users (optional)
+            company_features: Company features (optional)
+            company_ids: Company IDs (optional)
+            batch_size: Batch size (optional)
+            seq_len: Sequence length (optional)
+            
+        Returns:
+            If multi_task=True: Tuple of (category_logits, tax_type_logits)
+            If multi_task=False: Category logits
+        """
+        # Get batch size and sequence length if not provided
+        if batch_size is None and seq_features is not None:
+            batch_size = seq_features.shape[0]
+        if seq_len is None and seq_features is not None:
+            seq_len = seq_features.shape[1]
+        
+        # Forward pass through graph model
+        graph_output = self.graph_model(
+            x=x,
+            edge_index=edge_index,
+            edge_type=edge_type,
+            edge_attr=edge_attr,
+            seq_features=seq_features,
+            timestamps=timestamps,
+            company_features=company_features,
+            company_ids=company_ids,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            t0=t0,
+            t1=t1
+        )
+        
+        # Process tabular features through a projection layer to match the expected dimensions
+        graph_input_dim = self.temporal_model.graph_input_dim
+        
+        # Add projection if the dimensions don't match
+        if not hasattr(self, 'tabular_projection'):
+            self.tabular_projection = nn.Linear(
+                tabular_features.size(-1), 
+                graph_input_dim
+            ).to(tabular_features.device)
+        
+        # Project the tabular features to match expected dimensions
+        projected_tabular_features = self.tabular_projection(tabular_features)
+        
+        # Forward pass through temporal model
+        temporal_output = self.temporal_model(
+            graph_features=projected_tabular_features,
+            seq_features=seq_features,
+            tabular_features=projected_tabular_features,
+            timestamps=timestamps,
+            t0=t0,
+            t1=t1,
+            descriptions=descriptions,
+            user_features=user_features,
+            is_new_user=is_new_user,
+            company_features=company_features,
+            company_ids=company_ids
+        )
+        
+        # Calculate weights if using dynamic weighting
+        if self.use_dynamic_weighting:
+            # Extract features from outputs for weight calculation
+            if self.multi_task:
+                graph_cat, _ = graph_output
+                temporal_cat, _ = temporal_output
+            else:
+                graph_cat = graph_output
+                temporal_cat = temporal_output
+                
+            graph_features = self.graph_feature_extractor(graph_cat)
+            temporal_features = self.temporal_feature_extractor(temporal_cat)
+            
+            # Calculate weights
+            combined_features = torch.cat([graph_features, temporal_features], dim=1)
+            weights = self.weight_module(combined_features)
+            
+            graph_weight = weights[:, 0].unsqueeze(1)
+            temporal_weight = weights[:, 1].unsqueeze(1)
+        else:
+            # Use fixed weights
+            graph_weight = self.graph_weight
+            temporal_weight = self.temporal_weight
+        
+        # Combine the outputs based on weights
+        if self.multi_task:
+            # Unpack the outputs
+            graph_category, graph_tax = graph_output
+            temporal_category, temporal_tax = temporal_output
+            
+            # Weight and combine the outputs
+            combined_category = graph_weight * graph_category + temporal_weight * temporal_category
+            combined_tax = graph_weight * graph_tax + temporal_weight * temporal_tax
+            
+            # Apply output projections
+            category_logits = self.category_output(combined_category)
+            tax_type_logits = self.tax_type_output(combined_tax)
+            
+            return category_logits, tax_type_logits
+        else:
+            # Single task - combine directly
+            combined_output = graph_weight * graph_output + temporal_weight * temporal_output
+            category_logits = self.category_output(combined_output)
+            
+            return category_logits
+    
+    def prepare_data_from_dataframe(self, df):
+        """
+        Prepare data for the model from a DataFrame.
+        
+        Args:
+            df: DataFrame containing transaction data
+            
+        Returns:
+            Dictionary with prepared data
+        """
+        if not HAS_GRAPH_PROCESSING:
+            raise ImportError("build_transaction_relationship_graph is required but not available")
+            
+        # Build transaction relationship graph based on merchants, companies, etc.
+        edge_index, edge_attr, edge_type = build_transaction_relationship_graph(df)
+        
+        # Extract features
+        # This is a simplified placeholder - in practice you'd have more sophisticated
+        # feature extraction based on your data schema
+        features = []
+        
+        # Amount features
+        if 'amount' in df.columns:
+            amount = df['amount'].values
+            amount_normalized = (amount - np.mean(amount)) / (np.std(amount) + 1e-8)
+            features.append(amount_normalized)
+        
+        # Merchant features if available
+        if 'merchant_id' in df.columns:
+            # Convert to categorical indices
+            merchant_ids = pd.factorize(df['merchant_id'])[0]
+            # Normalize to [0, 1] range
+            merchant_ids_norm = merchant_ids / max(1, merchant_ids.max())
+            features.append(merchant_ids_norm)
+        
+        # Company features if available
+        if 'company_id' in df.columns:
+            company_ids = pd.factorize(df['company_id'])[0]
+            company_ids_norm = company_ids / max(1, company_ids.max())
+            features.append(company_ids_norm)
+            
+            # Extract actual company IDs for temporal grouping
+            company_ids_tensor = torch.tensor(company_ids, dtype=torch.long)
+        else:
+            company_ids_tensor = None
+        
+        # Combine features into a matrix
+        feature_matrix = np.column_stack(features) if features else np.zeros((len(df), 1))
+        node_features = torch.tensor(feature_matrix, dtype=torch.float)
+        
+        # Create sequence features from node features (simplified approach)
+        batch_size = min(100, len(df))  # Limit batch size
+        seq_len = 5  # Fixed sequence length for simplicity
+        
+        # Create dummy sequence features
+        seq_features = torch.zeros((batch_size, seq_len, node_features.shape[1]))
+        for i in range(batch_size):
+            # For each batch item, get a sequence of transactions
+            start_idx = i
+            for j in range(seq_len):
+                idx = (start_idx + j) % len(df)
+                seq_features[i, j] = node_features[idx]
+        
+        # Create timestamps (simplified)
+        if 'timestamp' in df.columns:
+            timestamps = df['timestamp'].values
+            if not isinstance(timestamps[0], (int, float)):
+                # Convert to seconds if datetime
+                timestamps = pd.to_datetime(timestamps).astype(int) / 10**9
+            timestamps_tensor = torch.tensor(timestamps[:batch_size * seq_len], dtype=torch.float)
+            timestamps_tensor = timestamps_tensor.view(batch_size, seq_len)
+        else:
+            # Create dummy timestamps
+            timestamps_tensor = torch.arange(batch_size * seq_len, dtype=torch.float).view(batch_size, seq_len)
+        
+        # Create tabular features
+        tabular_features = node_features[:batch_size].clone()
+        
+        # Prepare company features if available
+        company_features = None
+        if 'company_type' in df.columns or 'company_size' in df.columns:
+            company_feats = []
+            
+            # One-hot encode company type
+            if 'company_type' in df.columns:
+                company_types = pd.get_dummies(df['company_type'])
+                company_feats.append(company_types.values)
+                
+            # One-hot encode company size
+            if 'company_size' in df.columns:
+                company_sizes = pd.get_dummies(df['company_size'])
+                company_feats.append(company_sizes.values)
+                
+            # Combine features
+            company_feat_matrix = np.hstack(company_feats)
+            company_features = torch.tensor(company_feat_matrix[:batch_size], dtype=torch.float)
+        
+        # Package data
+        data = {
+            'x': node_features,
+            'edge_index': edge_index,
+            'edge_type': edge_type,
+            'edge_attr': edge_attr,
+            'seq_features': seq_features,
+            'timestamps': timestamps_tensor,
+            'tabular_features': tabular_features,
+            't0': 0.0,  # Dummy value
+            't1': 1.0,  # Dummy value
+            'company_features': company_features,
+            'company_ids': company_ids_tensor,
+            'batch_size': batch_size,
+            'seq_len': seq_len
+        }
+        
+        return data
+    
+    def extract_embeddings(self, data):
+        """
+        Extract embeddings from the graph model.
+        
+        Args:
+            data: Dictionary with prepared data
+            
+        Returns:
+            Node embeddings
+        """
+        self.eval()
+        with torch.no_grad():
+            # Extract embeddings from graph model
+            if hasattr(self.graph_model, 'extract_embeddings'):
+                embeddings = self.graph_model.extract_embeddings(
+                    x=data['x'],
+                    edge_index=data['edge_index'],
+                    edge_type=data['edge_type'],
+                    edge_attr=data['edge_attr']
+                )
+                return embeddings
+            else:
+                # Fallback for models without explicit embedding extraction
+                return None

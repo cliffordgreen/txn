@@ -403,16 +403,29 @@ class DynamicContextualTemporal(nn.Module):
             nn.Dropout(dropout)
         )
     
-    def forward(self, x: torch.Tensor, timestamps: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, timestamps: torch.Tensor, company_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass of the dynamic contextual temporal layer.
         
         Args:
             x: Input features [batch_size, seq_len, input_dim]
             timestamps: Timestamps [batch_size, seq_len]
+            company_ids: Company IDs for each transaction [batch_size, seq_len] (optional)
             
         Returns:
             Temporally encoded features [batch_size, seq_len, hidden_dim]
+        """
+        batch_size, seq_len, _ = x.shape
+        
+        # Check if company grouping should be applied
+        if company_ids is not None:
+            return self._forward_with_company_grouping(x, timestamps, company_ids)
+        else:
+            return self._forward_standard(x, timestamps)
+    
+    def _forward_standard(self, x: torch.Tensor, timestamps: torch.Tensor) -> torch.Tensor:
+        """
+        Standard forward pass without company grouping.
         """
         batch_size, seq_len, _ = x.shape
         
@@ -485,6 +498,143 @@ class DynamicContextualTemporal(nn.Module):
         
         # Output projection
         output = self.output_projection(contextual_output)
+        
+        return output
+    
+    def _forward_with_company_grouping(self, x: torch.Tensor, timestamps: torch.Tensor, company_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass with company-based grouping for temporal modeling.
+        
+        This applies temporal modeling separately to transactions from each company,
+        respecting the business entity boundaries.
+        """
+        batch_size, seq_len, _ = x.shape
+        device = x.device
+        
+        # Get unique company IDs
+        if company_ids.dim() == 1:
+            # If company_ids is [batch_size], expand to [batch_size, seq_len]
+            company_ids = company_ids.unsqueeze(1).expand(-1, seq_len)
+        
+        # Flatten for easier processing
+        flat_x = x.reshape(-1, x.size(-1))  # [batch_size * seq_len, hidden_dim]
+        flat_timestamps = timestamps.reshape(-1)  # [batch_size * seq_len]
+        flat_company_ids = company_ids.reshape(-1)  # [batch_size * seq_len]
+        
+        # Get unique companies
+        unique_companies = torch.unique(flat_company_ids)
+        num_companies = len(unique_companies)
+        
+        # Pre-allocate output tensor
+        flat_output = torch.zeros_like(flat_x)
+        
+        # Process each company's transactions separately
+        for company_idx in unique_companies:
+            # Get mask for this company's transactions
+            company_mask = (flat_company_ids == company_idx)
+            
+            # Skip if no transactions for this company
+            if not torch.any(company_mask):
+                continue
+                
+            # Get company data
+            company_x = flat_x[company_mask]
+            company_timestamps = flat_timestamps[company_mask]
+            
+            # Need at least 2 transactions for temporal processing
+            if len(company_timestamps) < 2:
+                # Just apply a simple projection for single transactions
+                company_output = self.output_projection(company_x.unsqueeze(0)).squeeze(0)
+                flat_output[company_mask] = company_output
+                continue
+                
+            # Sort by timestamp within this company
+            sorted_indices = torch.argsort(company_timestamps)
+            sorted_x = company_x[sorted_indices]
+            sorted_timestamps = company_timestamps[sorted_indices]
+            
+            # Reshape for temporal processing
+            company_seq_len = len(sorted_indices)
+            reshaped_x = sorted_x.unsqueeze(0)  # [1, company_seq_len, hidden_dim]
+            reshaped_timestamps = sorted_timestamps.unsqueeze(0)  # [1, company_seq_len]
+            
+            # Create time differences for this company only
+            timestamps_expanded = reshaped_timestamps.unsqueeze(2).expand(-1, -1, company_seq_len)
+            timestamps_transposed = reshaped_timestamps.unsqueeze(1).expand(-1, company_seq_len, -1)
+            
+            # Time difference and direction
+            time_diff = timestamps_expanded - timestamps_transposed  # [1, company_seq_len, company_seq_len]
+            time_direction = torch.sign(time_diff).float()
+            time_magnitude = torch.log1p(torch.abs(time_diff) / 3600).float()  # Log-scaled hours
+            
+            # Time features for different time scales
+            time_features = torch.stack([time_direction, time_magnitude], dim=-1)  # [1, company_seq_len, company_seq_len, 2]
+            
+            # Process each time scale
+            timescale_outputs = []
+            for i in range(self.num_timescales):
+                # Scale factor for different time scales (hours, days, weeks)
+                scale_factor = 10 ** i
+                scaled_time_features = time_features.clone()
+                scaled_time_features[..., 1] = scaled_time_features[..., 1] / scale_factor
+                
+                # Encode time features
+                encoded_time = self.timescale_encoders[i](scaled_time_features)
+                
+                # Reshape for attention
+                encoded_time = encoded_time.view(1, company_seq_len, company_seq_len, -1)
+                
+                # Create attention mask from time features
+                attention_weights = torch.mean(encoded_time, dim=-1)  # [1, company_seq_len, company_seq_len]
+                
+                # Apply attention
+                try:
+                    attended_features, _ = self.timescale_attention[i](
+                        query=reshaped_x,
+                        key=reshaped_x,
+                        value=reshaped_x,
+                        attn_mask=attention_weights
+                    )
+                except RuntimeError:
+                    # Fallback to no mask if shape mismatch
+                    attended_features, _ = self.timescale_attention[i](
+                        query=reshaped_x,
+                        key=reshaped_x,
+                        value=reshaped_x
+                    )
+                
+                timescale_outputs.append(attended_features)
+            
+            # Combine different time scales
+            combined_timescales = torch.cat(timescale_outputs, dim=-1)  # [1, company_seq_len, hidden_dim * num_timescales]
+            
+            # Dynamic mixing weights
+            mixing_weights = self.time_mixer(combined_timescales)  # [1, company_seq_len, num_timescales]
+            
+            # Weight each time scale output
+            weighted_outputs = torch.zeros(1, company_seq_len, self.hidden_dim, device=device)
+            for i in range(self.num_timescales):
+                weighted_outputs += mixing_weights[..., i:i+1] * timescale_outputs[i]
+            
+            # Apply contextual encoder - only if we have enough sequence length
+            if company_seq_len >= 2:
+                contextual_output = self.contextual_encoder(weighted_outputs)
+            else:
+                contextual_output = weighted_outputs
+            
+            # Output projection
+            company_output = self.output_projection(contextual_output.squeeze(0))
+            
+            # Unsort to original order
+            unsorted_output = torch.zeros_like(company_output)
+            for i, idx in enumerate(sorted_indices):
+                unsorted_output[idx] = company_output[i]
+            
+            # Store in the correct position in the overall output
+            flat_output[company_mask] = unsorted_output
+        
+        # Reshape output back to original batch shape
+        output = flat_output.view(batch_size, seq_len, -1)
         
         return output
 
@@ -863,7 +1013,8 @@ class HyperTemporalTransactionModel(nn.Module):
                 t0: float, t1: float, descriptions: List[str] = None,
                 auto_align_dims: bool = True, user_features: Optional[torch.Tensor] = None,
                 is_new_user: Optional[torch.Tensor] = None, 
-                company_features: Optional[torch.Tensor] = None) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+                company_features: Optional[torch.Tensor] = None,
+                company_ids: Optional[torch.Tensor] = None) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Forward pass of the hyper-temporal transaction model.
         
@@ -879,6 +1030,8 @@ class HyperTemporalTransactionModel(nn.Module):
             user_features: User features [batch_size, user_dim] (optional)
             is_new_user: Boolean tensor indicating if user is new [batch_size] (optional)
             company_features: Company features [batch_size, company_input_dim] (optional)
+            company_ids: Company IDs for grouping transactions in temporal modeling [batch_size] or [batch_size, seq_len] (optional)
+                         When provided, temporal modeling will be applied separately to transactions from each company
             
         Returns:
             If multi_task=True: Tuple of (category_logits, tax_type_logits)
@@ -1097,9 +1250,35 @@ class HyperTemporalTransactionModel(nn.Module):
         
         # Apply temporal layers with residual connections
         h = fused_features
+        
+        # Check if company_ids were explicitly provided in the function call
+        if company_ids is None and company_features is not None:
+            try:
+                # If we have company features, extract company IDs for temporal grouping
+                if hasattr(self, 'graph') and self.graph is not None:
+                    if hasattr(self.graph, 'company_id_mapping') and hasattr(self.graph, 'transaction_to_company'):
+                        # Use graph-based mappings if available
+                        company_ids = self.graph.transaction_to_company
+                    elif hasattr(self.graph, 'transaction') and hasattr(self.graph.transaction, 'company_id'):
+                        # Use the company_id column if it exists in the graph's transaction data
+                        company_ids = self.graph.transaction.company_id
+            except Exception as e:
+                print(f"Warning: Could not extract company IDs from graph structure: {e}")
+            
+            # If we still don't have company IDs, generate them from the batch
+            if company_ids is None:
+                if company_features.size(0) == batch_size:
+                    # Use company features index as proxy for company ID
+                    # This works if each row in company_features is a unique company
+                    company_ids = torch.arange(batch_size, device=company_features.device)
+                    print(f"Using batch indices as proxy for company IDs for temporal grouping")
+        
         for i in range(self.num_layers):
-            # Apply temporal layer
-            h_temporal = self.temporal_layers[i](h, timestamps)
+            # Apply temporal layer with company grouping if IDs are available
+            if company_ids is not None:
+                h_temporal = self.temporal_layers[i](h, timestamps, company_ids)
+            else:
+                h_temporal = self.temporal_layers[i](h, timestamps)
             
             # Apply neural ODE if enabled
             if self.use_neural_ode:
@@ -1287,7 +1466,8 @@ class HyperTemporalEnsemble(nn.Module):
                 t0: float, t1: float, descriptions: List[str] = None,
                 user_features: Optional[torch.Tensor] = None,
                 is_new_user: Optional[torch.Tensor] = None,
-                company_features: Optional[torch.Tensor] = None) -> torch.Tensor:
+                company_features: Optional[torch.Tensor] = None,
+                company_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass of the hyper-temporal ensemble.
         
@@ -1302,6 +1482,8 @@ class HyperTemporalEnsemble(nn.Module):
             user_features: User features [batch_size, user_dim] (optional)
             is_new_user: Boolean tensor indicating if user is new [batch_size] (optional)
             company_features: Company features [batch_size, company_input_dim] (optional)
+            company_ids: Company IDs for grouping transactions in temporal modeling [batch_size] or [batch_size, seq_len] (optional)
+                         When provided, temporal modeling will be applied separately to transactions from each company
             
         Returns:
             Output logits [batch_size, output_dim]
@@ -1316,7 +1498,8 @@ class HyperTemporalEnsemble(nn.Module):
                 timestamps, t0, t1, descriptions,
                 user_features=user_features,
                 is_new_user=is_new_user,
-                company_features=company_features
+                company_features=company_features,
+                company_ids=company_ids
             )
             all_logits.append(logits)
         

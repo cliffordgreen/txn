@@ -307,6 +307,24 @@ class TransactionFeedbackClassifier:
                 company_features = self.graph['company'].x
                 
             print(f"Using company features of shape: {company_features.shape}")
+            
+            # Apply dimension reduction if company features are too large and we have a reducer
+            if hasattr(self, 'company_dim_reducer') and company_features.size(1) > 1000:
+                orig_shape = company_features.shape
+                print(f"Applying company feature dimension reduction from shape {orig_shape}")
+                
+                # Reshape if needed
+                if company_features.dim() > 2:
+                    company_features = company_features.reshape(-1, company_features.size(-1))
+                
+                # Apply reduction
+                company_features = self.company_dim_reducer(company_features)
+                
+                # Reshape back if needed
+                if len(orig_shape) > 2:
+                    company_features = company_features.reshape(orig_shape[0], orig_shape[1], -1)
+                    
+                print(f"Reduced company features to shape {company_features.shape}")
         else:
             print("No company features available in the graph")
         
@@ -353,6 +371,27 @@ class TransactionFeedbackClassifier:
         # Set graph input dimension if provided
         if graph_input_dim is None:
             graph_input_dim = input_dim
+        
+        # Check company feature dimensions and print info for debugging
+        if company_input_dim is not None:
+            print(f"Company features shape: {company_input_dim}")
+            
+            # If company feature dimension is very large, add a dimension reduction layer
+            if company_input_dim > 1000:
+                print(f"Adding company feature dimension reduction from {company_input_dim} to 202")
+                reduced_company_dim = 202  # Target dimension for company features
+                
+                # Create company dimension reduction layer
+                self.company_dim_reducer = nn.Sequential(
+                    nn.Linear(company_input_dim, min(512, company_input_dim // 10)),
+                    nn.ReLU(),
+                    nn.Linear(min(512, company_input_dim // 10), reduced_company_dim)
+                )
+                
+                # Use reduced dimension for the model
+                company_input_dim = reduced_company_dim
+                
+                print(f"Using reduced company input dimension: {company_input_dim}")
             
         # Initialize model
         if self.use_ensemble:

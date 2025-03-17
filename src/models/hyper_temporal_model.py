@@ -697,7 +697,7 @@ class HyperTemporalTransactionModel(nn.Module):
                 self.text_processor = FinBERTProcessor(
                     output_dim=self.text_dim,
                     pooling_strategy="mean",
-                    test_mode=True  # Set to False in production for real models
+                    test_mode=False  # Set to False in production for real models
                 )
             elif text_processor_type == "llm":
                 self.text_processor = TransactionLLMProcessor(

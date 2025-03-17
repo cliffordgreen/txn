@@ -16,7 +16,7 @@ class TransformerTextProcessor:
     def __init__(self, model_name: str = "distilbert-base-uncased", 
                  max_length: int = 128, output_dim: int = 384,
                  fine_tune: bool = True, pooling_strategy: str = "cls",
-                 test_mode: bool = True):  # Added test_mode parameter for testing
+                 test_mode: bool = False):  # Set default to download the model
         """
         Initialize the transformer text processor.
         
@@ -166,7 +166,7 @@ class FinBERTProcessor(TransformerTextProcessor):
     
     def __init__(self, max_length: int = 128, output_dim: int = 384,
                  fine_tune: bool = True, pooling_strategy: str = "cls",
-                 test_mode: bool = True):  # Added test_mode parameter
+                 test_mode: bool = False):  # Set default to download the model
         """
         Initialize the FinBERT processor.
         

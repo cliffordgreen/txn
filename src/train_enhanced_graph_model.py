@@ -68,6 +68,7 @@ if module_path not in sys.path:
 from src.models.hybrid_transaction_model import EnhancedHybridTransactionModel
 from src.data_processing.transaction_graph import build_transaction_relationship_graph, extract_graph_features
 from torch.utils.data import Dataset, DataLoader
+from src.utils.model_utils import configure_for_hardware, plot_training_curves
 
 
 # Configuration class
@@ -614,29 +615,82 @@ def prepare_model_inputs(batch_df, model, device):
         category_values = batch_df['category_id'].values
         
         # Check for and handle string values in category_id
-        if category_values.dtype == object:  # Object dtype suggests strings or mixed types
-            print("Warning: Found non-numeric category_id values. Converting to integers...")
+        print(f"Original category_id dtype: {batch_df['category_id'].dtype}")
+        print(f"Sample category_id values: {batch_df['category_id'].head().tolist()}")
+        
+        # Handle pandas categorical type directly
+        if hasattr(batch_df['category_id'], 'cat'):
+            print("Converting pandas categorical to numeric codes")
+            # Get the categorical codes (integers) instead of the string values
+            category_values = batch_df['category_id'].cat.codes.values
+            # Handle -1 values (which represent NaN in categorical codes)
+            category_values = np.where(category_values < 0, 0, category_values)
+        # Handle string or object dtype
+        elif batch_df['category_id'].dtype == object:
+            print("Converting string/object category_id values to integers")
             try:
-                # Try to convert to numeric values first
-                category_values = pd.to_numeric(batch_df['category_id'], errors='coerce').fillna(0).astype(np.int64).values
+                # Try to convert to numeric directly
+                numeric_vals = pd.to_numeric(batch_df['category_id'], errors='coerce')
+                # Check if conversion worked for most values
+                if numeric_vals.isna().mean() < 0.5:  # Less than 50% NaN
+                    print("Direct numeric conversion mostly succeeded")
+                    category_values = numeric_vals.fillna(0).astype(np.int64).values
+                else:
+                    # Use factorize for string values
+                    print("Using factorize for string conversion")
+                    category_codes, uniques = pd.factorize(batch_df['category_id'])
+                    print(f"Mapped to {len(uniques)} unique categories")
+                    category_values = category_codes.astype(np.int64)
             except Exception as e:
-                print(f"Error converting category_id to numeric: {str(e)}")
-                # Fallback: use factorize to create integer codes for strings
-                print("Using factorize to convert categorical values to integer codes")
+                print(f"Error in direct conversion: {str(e)}")
+                # Fallback to factorize
+                print("Falling back to factorize for conversion")
+                category_codes, _ = pd.factorize(batch_df['category_id'])
+                category_values = category_codes.astype(np.int64)
+        else:
+            # Numeric type, but ensure it's the right format
+            try:
+                # Ensure we have int64 values
+                category_values = batch_df['category_id'].astype(np.int64).values
+            except Exception as e:
+                print(f"Error converting numeric category_id: {str(e)}")
+                # Last resort: factorize everything
                 category_codes, _ = pd.factorize(batch_df['category_id'])
                 category_values = category_codes.astype(np.int64)
         
-        # Create tensor with explicit dtype and error checking
+        # Create tensor with explicit dtype and enhanced error handling
         try:
+            # Print conversion results for debugging
+            print(f"Converted category values dtype: {category_values.dtype}, shape: {category_values.shape}")
+            print(f"Converted sample values: {category_values[:5]}")
+            
+            # Ensure the values are 1D (flatten if needed)
+            if len(category_values.shape) > 1:
+                print(f"Flattening category values from shape {category_values.shape}")
+                category_values = category_values.flatten()
+            
+            # Check for any NaN values
+            if np.isnan(category_values).any():
+                print("Warning: NaN values found in category_values, replacing with 0")
+                category_values = np.nan_to_num(category_values, nan=0).astype(np.int64)
+            
+            # Create the tensor
             category_tensor = torch.tensor(
                 category_values, 
                 dtype=torch.long,
                 device=device  # Create tensor directly on target device
             )
             labels['category'] = category_tensor
+            
+            # Final safety check
+            if torch.isnan(category_tensor).any() or torch.isinf(category_tensor).any():
+                print("Warning: NaN or Inf values in category tensor after creation")
+                category_tensor = torch.nan_to_num(category_tensor, nan=0)
+                labels['category'] = category_tensor
+                
         except Exception as e:
             print(f"Error creating category tensor: {str(e)}")
-            print(f"Category values dtype: {category_values.dtype}, shape: {category_values.shape}")
+            print(f"Category values detail - dtype: {category_values.dtype}, shape: {category_values.shape}")
             print(f"Sample values: {category_values[:5]}")
             # Last resort fallback - create zeros tensor of correct shape
             category_tensor = torch.zeros(len(batch_df), dtype=torch.long, device=device)
@@ -695,8 +749,8 @@ def create_cuda_graph(model, sample_data):
             print(f"CUDA version {cuda_version} may not fully support CUDA graphs. Continuing anyway...")
 
         # Get model's expected input signature to extract only needed inputs
-        # Get device from model parameters
-        device = next(model.parameters()).device
+        # Get device - directly use the device passed to model creation rather than from parameters
+        # which could be uninitialized with LazyLinear layers
         
         # Filter inputs based on model's forward method signature
         # This gets only the inputs the model actually needs
@@ -2148,12 +2202,18 @@ def main():
         model = initialize_model(config.hidden_dim, num_categories, num_tax_types, config, device)
         log_memory_usage("after model initialization")
         
-        # Count parameters
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        
-        print(f"✓ Model initialized with {total_params:,} total parameters")
-        print(f"✓ Trainable parameters: {trainable_params:,} ({trainable_params/total_params*100:.1f}%)")
+        # Count parameters - handle LazyLinear layers
+        try:
+            # First try to count parameters directly
+            total_params = sum(p.numel() for p in model.parameters())
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            
+            print(f"✓ Model initialized with {total_params:,} total parameters")
+            print(f"✓ Trainable parameters: {trainable_params:,} ({trainable_params/total_params*100:.1f}%)")
+        except ValueError as e:
+            # If we get an error about uninitialized parameters (LazyLinear)
+            print("⚠️ Model uses LazyLinear layers - parameters will be initialized during first forward pass")
+            print("⚠️ Parameter count will be available after training begins")
         
         # Training phase
         print("\n🏋️ Training Phase")

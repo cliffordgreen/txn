@@ -175,9 +175,11 @@ class GraphEnhancedTemporalModel(nn.Module):
         if not HAS_PYG:
             raise ImportError("This model requires PyTorch Geometric to be installed")
             
-        # Input projection
+        # Input projection with flexible input dimension handling
+        # This will handle both 128 and 512 dimension inputs
         self.input_projection = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            # First check input dimension and adapt
+            nn.LazyLinear(hidden_dim),  # LazyLinear infers input dim at runtime
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout)

@@ -614,6 +614,13 @@ class DynamicContextualTemporal(nn.Module):
         batch_size, seq_len, _ = x.shape
         device = x.device
         
+        # Handle special case when timestamps has shape [batch_size, 1]
+        if timestamps.dim() == 2 and timestamps.size(1) == 1:
+            print(f"Detected timestamps with shape {timestamps.shape} - expanding to match seq_len {seq_len}")
+            # Expand the timestamps to match the expected sequence length
+            expanded_timestamps = timestamps.expand(-1, seq_len)
+            timestamps = expanded_timestamps
+        
         # Get unique company IDs
         if company_ids.dim() == 1:
             # If company_ids is [batch_size], expand to [batch_size, seq_len]
@@ -621,6 +628,7 @@ class DynamicContextualTemporal(nn.Module):
         
         # Flatten for easier processing
         flat_x = x.reshape(-1, x.size(-1))  # [batch_size * seq_len, hidden_dim]
+        # Handle 2D timestamps - need to flatten to 1D 
         flat_timestamps = timestamps.reshape(-1)  # [batch_size * seq_len]
         flat_company_ids = company_ids.reshape(-1)  # [batch_size * seq_len]
         

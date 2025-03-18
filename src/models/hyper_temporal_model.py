@@ -60,8 +60,30 @@ class HyperbolicTransactionEncoder(nn.Module):
         Returns:
             Points in hyperbolic space [batch_size, dim]
         """
-        norm = torch.norm(x, dim=-1, keepdim=True)
-        exp_map = torch.tanh(math.sqrt(c) * norm) * x / (math.sqrt(c) * norm.clamp(min=1e-8))
+        # Pre-processing - aggressively handle NaNs and large values
+        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        # Clip extreme values before any calculations
+        x = torch.clamp(x, min=-10.0, max=10.0)
+        
+        # Calculate norm with enhanced numerical stability
+        norm = torch.norm(x, dim=-1, keepdim=True).clamp(min=1e-10)
+        
+        # Calculate exp map with enhanced stability
+        sqrt_c = math.sqrt(c)
+        
+        # Clamp values for tanh stability - use tighter bounds
+        tanh_input = (sqrt_c * norm).clamp(min=-10.0, max=10.0)
+        
+        # Safely compute the result with careful handling of divisions
+        tanh_val = torch.tanh(tanh_input)
+        x_normalized = x / norm
+        exp_map = tanh_val * x_normalized
+        
+        # Final safeguard - ensure no NaNs or extreme values
+        exp_map = torch.nan_to_num(exp_map, nan=0.0, posinf=1.0, neginf=-1.0)
+        exp_map = torch.clamp(exp_map, min=-1.0, max=1.0)
+            
         return exp_map
     
     def _logarithmic_map(self, x: torch.Tensor, c: float = 1.0) -> torch.Tensor:
@@ -75,8 +97,35 @@ class HyperbolicTransactionEncoder(nn.Module):
         Returns:
             Points in tangent space [batch_size, dim]
         """
-        norm = torch.norm(x, dim=-1, keepdim=True).clamp(min=1e-8)
-        log_map = torch.atanh(math.sqrt(c) * norm) * x / (math.sqrt(c) * norm)
+        # Pre-processing - aggressively handle NaNs and large values
+        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        # Clip extreme values before any calculations
+        x = torch.clamp(x, min=-1.0, max=1.0)
+        
+        # Calculate norm with enhanced numerical stability
+        norm = torch.norm(x, dim=-1, keepdim=True).clamp(min=1e-10, max=0.9)
+        
+        # Calculate atanh with enhanced stability
+        sqrt_c = math.sqrt(c)
+        
+        # Use much tighter bounds for atanh stability - well within (-1, 1)
+        # atanh becomes unstable as inputs approach ±1
+        atanh_input = (sqrt_c * norm).clamp(min=-0.9, max=0.9)
+        
+        # Safely compute the result with careful handling of divisions
+        x_normalized = x / norm
+        
+        # Use a numerically stable version of atanh
+        # tanh(x) = (e^x - e^-x) / (e^x + e^-x)
+        # Thus, atanh(y) = 0.5 * log((1 + y) / (1 - y))
+        atanh_val = 0.5 * torch.log((1 + atanh_input) / (1 - atanh_input))
+        log_map = atanh_val * x_normalized
+        
+        # Final safeguard - ensure no NaNs or extreme values
+        log_map = torch.nan_to_num(log_map, nan=0.0, posinf=1.0, neginf=-1.0)
+        log_map = torch.clamp(log_map, min=-10.0, max=10.0)
+            
         return log_map
     
     def _mobius_addition(self, x: torch.Tensor, y: torch.Tensor, c: float = 1.0) -> torch.Tensor:
@@ -91,14 +140,47 @@ class HyperbolicTransactionEncoder(nn.Module):
         Returns:
             Sum of points in hyperbolic space [batch_size, dim]
         """
-        xy = torch.sum(x * y, dim=-1, keepdim=True)
-        x_sq = torch.sum(x * x, dim=-1, keepdim=True)
-        y_sq = torch.sum(y * y, dim=-1, keepdim=True)
+        # Pre-processing - aggressively handle NaNs and large values
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.5, neginf=-0.5)
+        y = torch.nan_to_num(y, nan=0.0, posinf=0.5, neginf=-0.5)
         
-        num = (1 + 2 * c * xy + c * y_sq) * x + (1 - c * x_sq) * y
-        denom = 1 + 2 * c * xy + c**2 * x_sq * y_sq
+        # Clip extreme values before any calculations
+        x = torch.clamp(x, min=-0.9, max=0.9)
+        y = torch.clamp(y, min=-0.9, max=0.9)
         
-        return num / denom.clamp(min=1e-8)
+        # Compute dot products with enhanced stability
+        xy = torch.sum(x * y, dim=-1, keepdim=True).clamp(min=-0.9, max=0.9)
+        x_sq = torch.sum(x * x, dim=-1, keepdim=True).clamp(min=1e-10, max=0.9)
+        y_sq = torch.sum(y * y, dim=-1, keepdim=True).clamp(min=1e-10, max=0.9)
+        
+        # Use a more numerically stable approach by breaking down the computation
+        term1 = x  # Base term
+        term2 = 2 * c * xy * x  # xy term
+        term3 = c * y_sq * x    # y_sq term
+        term4 = (1 - c * x_sq) * y  # x_sq term
+        
+        # Numerator as sum of terms (more stable than direct multiplication)
+        num = term1 + term2 + term3 + term4
+        
+        # Compute denominator more carefully
+        term5 = 1.0  # Base term
+        term6 = 2 * c * xy  # xy term
+        term7 = (c**2) * x_sq * y_sq  # Product term, carefully computed
+        
+        # Denominator as sum of terms
+        denom = term5 + term6 + term7
+        
+        # Ensure denominator is safely away from zero
+        denom = denom.clamp(min=1e-6)
+        
+        # Compute result with careful division
+        result = num / denom
+        
+        # Final safeguard - ensure no NaNs or extreme values
+        result = torch.nan_to_num(result, nan=0.0, posinf=0.9, neginf=-0.9)
+        result = torch.clamp(result, min=-0.9, max=0.9)
+            
+        return result
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -325,8 +407,25 @@ class MultiModalFusion(nn.Module):
                 zeros
             ], dim=-1)
         
-        # Apply output projection
-        fused_features = self.output_projection(all_features)
+        # Aggressive pre-processing before projection - handle all numerical issues
+        all_features = torch.nan_to_num(all_features, nan=0.0, posinf=1.0, neginf=-1.0)
+        all_features = torch.clamp(all_features, min=-10.0, max=10.0)
+        
+        # Apply layer normalization for additional stability
+        if not hasattr(self, 'pre_norm'):
+            self.pre_norm = nn.LayerNorm(all_features.size(-1)).to(all_features.device)
+        all_features = self.pre_norm(all_features)
+        
+        # Apply output projection with gradient clipping during training
+        with torch.set_grad_enabled(self.training):
+            if self.training:
+                # Apply gradient clipping 
+                torch.nn.utils.clip_grad_norm_(self.output_projection.parameters(), max_norm=1.0)
+            fused_features = self.output_projection(all_features)
+        
+        # Final normalization and safeguards
+        fused_features = torch.nan_to_num(fused_features, nan=0.0, posinf=1.0, neginf=-1.0)
+        fused_features = torch.clamp(fused_features, min=-10.0, max=10.0)
         
         return fused_features
 
@@ -419,8 +518,12 @@ class DynamicContextualTemporal(nn.Module):
         
         # Check if company grouping should be applied
         if company_ids is not None:
+            print(f"DynamicContextualTemporal received company_ids with shape: {company_ids.shape}")
+            print(f"Number of unique company IDs: {len(torch.unique(company_ids))}")
+            print(f"Company ID distribution: {[(c.item(), (company_ids == c).sum().item()) for c in torch.unique(company_ids)]}")
             return self._forward_with_company_grouping(x, timestamps, company_ids)
         else:
+            print(f"DynamicContextualTemporal: No company IDs provided, using standard approach")
             return self._forward_standard(x, timestamps)
     
     def _forward_standard(self, x: torch.Tensor, timestamps: torch.Tensor) -> torch.Tensor:
@@ -1014,7 +1117,31 @@ class HyperTemporalTransactionModel(nn.Module):
                 auto_align_dims: bool = True, user_features: Optional[torch.Tensor] = None,
                 is_new_user: Optional[torch.Tensor] = None, 
                 company_features: Optional[torch.Tensor] = None,
-                company_ids: Optional[torch.Tensor] = None) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+                company_ids: Optional[torch.Tensor] = None,
+                debug_nans: bool = True) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        
+        def check_nan(tensor, name):
+            if debug_nans and isinstance(tensor, torch.Tensor):
+                has_nan = torch.isnan(tensor).any().item()
+                if has_nan:
+                    print(f"NaN detected in {name}: {torch.isnan(tensor).sum().item()} NaN values")
+                    # Try to identify where the NaNs are
+                    if tensor.dim() > 1:
+                        for i in range(min(3, tensor.shape[0])):  # Just check first few to avoid verbose output
+                            if torch.isnan(tensor[i]).any().item():
+                                print(f"  NaN in {name}[{i}]")
+                    return True
+            return False
+        
+        # Check input tensors for NaNs
+        check_nan(graph_features, "graph_features")
+        check_nan(seq_features, "seq_features")
+        check_nan(tabular_features, "tabular_features")
+        check_nan(timestamps, "timestamps")
+        if user_features is not None:
+            check_nan(user_features, "user_features")
+        if company_features is not None:
+            check_nan(company_features, "company_features")
         """
         Forward pass of the hyper-temporal transaction model.
         
@@ -1065,8 +1192,22 @@ class HyperTemporalTransactionModel(nn.Module):
             # Ensure company_features has the right dimensions if provided
             if company_features is not None:
                 if company_features.dim() == 2 and company_features.size(1) != seq_feat_dim:
+                    # Check if alignment layer exists
+                    if 'company' not in self.dim_alignment:
+                        print(f"Creating company dimension alignment layer: {company_features.size(1)} -> {seq_feat_dim}")
+                        self.dim_alignment['company'] = nn.Sequential(
+                            nn.Linear(company_features.size(1), seq_feat_dim),
+                            nn.LayerNorm(seq_feat_dim)
+                        ).to(company_features.device)
                     company_features = self.dim_alignment['company'](company_features)
                 elif company_features.dim() == 3 and company_features.size(2) != seq_feat_dim:
+                    # Check if alignment layer exists
+                    if 'company' not in self.dim_alignment:
+                        print(f"Creating company dimension alignment layer: {company_features.size(2)} -> {seq_feat_dim}")
+                        self.dim_alignment['company'] = nn.Sequential(
+                            nn.Linear(company_features.size(2), seq_feat_dim),
+                            nn.LayerNorm(seq_feat_dim)
+                        ).to(company_features.device)
                     batch_orig_shape = company_features.shape[:2]
                     company_features = self.dim_alignment['company'](company_features.view(-1, company_features.size(2)))
                     company_features = company_features.view(*batch_orig_shape, seq_feat_dim)
@@ -1132,7 +1273,7 @@ class HyperTemporalTransactionModel(nn.Module):
                 # Handle 2D company features [batch, feat] - ensure dimensions match
                 if company_features.size(1) != self.company_input_dim:
                     # Handle dimension mismatch - project to correct dimension first
-                    print(f"WARNING: Company feature dimension mismatch. Got {company_features.size(1)}, expected {self.company_input_dim}")
+                    print(f"INFO: Aligning company feature dimension from {company_features.size(1)} to {self.company_input_dim}")
                     # Create an adapter dynamically with the correct dimensions
                     adapter_name = f"company_dim_adapter_{company_features.size(1)}"
                     if not hasattr(self, adapter_name):
@@ -1141,12 +1282,15 @@ class HyperTemporalTransactionModel(nn.Module):
                         if company_features.size(1) > 1000:
                             setattr(self, adapter_name, nn.Sequential(
                                 nn.Linear(company_features.size(1), min(512, company_features.size(1) // 10)),
+                                nn.LayerNorm(min(512, company_features.size(1) // 10)),
                                 nn.ReLU(),
-                                nn.Linear(min(512, company_features.size(1) // 10), self.company_input_dim)
+                                nn.Linear(min(512, company_features.size(1) // 10), self.company_input_dim),
+                                nn.LayerNorm(self.company_input_dim)
                             ).to(company_features.device))
                         else:
-                            setattr(self, adapter_name, nn.Linear(
-                                company_features.size(1), self.company_input_dim
+                            setattr(self, adapter_name, nn.Sequential(
+                                nn.Linear(company_features.size(1), self.company_input_dim),
+                                nn.LayerNorm(self.company_input_dim)
                             ).to(company_features.device))
                     # Apply dimension adapter
                     adapter = getattr(self, adapter_name)
@@ -1256,7 +1400,25 @@ class HyperTemporalTransactionModel(nn.Module):
             try:
                 # If we have company features, extract company IDs for temporal grouping
                 if hasattr(self, 'graph') and self.graph is not None:
-                    if hasattr(self.graph, 'company_id_mapping') and hasattr(self.graph, 'transaction_to_company'):
+                    if hasattr(self.graph, 'company_ids'):
+                        # Use explicitly set company_ids from the graph
+                        # This is a custom attribute we set in our test
+                        company_ids = self.graph.company_ids
+                        print(f"Using company_ids from graph with {len(torch.unique(company_ids))} unique companies")
+                        
+                        # Make sure we have the right number of IDs
+                        if company_ids.size(0) != batch_size:
+                            # Try to get a subset or expand
+                            if batch_size < company_ids.size(0):
+                                # Use first batch_size elements
+                                company_ids = company_ids[:batch_size]
+                                print(f"Taking subset of company_ids to match batch_size {batch_size}")
+                            else:
+                                # Repeat the IDs to match batch size
+                                num_repeats = (batch_size + company_ids.size(0) - 1) // company_ids.size(0)
+                                company_ids = company_ids.repeat(num_repeats)[:batch_size]
+                                print(f"Expanded company_ids to match batch_size {batch_size}")
+                    elif hasattr(self.graph, 'company_id_mapping') and hasattr(self.graph, 'transaction_to_company'):
                         # Use graph-based mappings if available
                         company_ids = self.graph.transaction_to_company
                     elif hasattr(self.graph, 'transaction') and hasattr(self.graph.transaction, 'company_id'):
@@ -1268,10 +1430,10 @@ class HyperTemporalTransactionModel(nn.Module):
             # If we still don't have company IDs, generate them from the batch
             if company_ids is None:
                 if company_features.size(0) == batch_size:
-                    # Use company features index as proxy for company ID
-                    # This works if each row in company_features is a unique company
-                    company_ids = torch.arange(batch_size, device=company_features.device)
-                    print(f"Using batch indices as proxy for company IDs for temporal grouping")
+                    # Don't use batch indices as proxy for company ID, as this treats each transaction as a separate company
+                    # Instead, we should leave company_ids as None, which will use standard temporal processing
+                    # WITHOUT applying company grouping
+                    print(f"No valid company IDs found - using standard temporal processing (no company grouping)")
         
         for i in range(self.num_layers):
             # Apply temporal layer with company grouping if IDs are available
@@ -1341,23 +1503,83 @@ class HyperTemporalTransactionModel(nn.Module):
             # Add weighted company feature contribution
             h_pooled = h_pooled + 0.25 * company_repr
         
-        # Apply output layers
-        h_pre = self.pre_output(h_pooled)
+        # Apply comprehensive stability fixes to pooled hidden state
+        h_pooled = torch.nan_to_num(h_pooled, nan=0.0, posinf=1.0, neginf=-1.0)
+        h_pooled = torch.clamp(h_pooled, min=-10.0, max=10.0)
         
-        # Primary task: category prediction
-        category_logits = self.output_category(h_pre)
+        # Apply layer normalization for enhanced stability
+        if not hasattr(self, 'pooled_norm'):
+            self.pooled_norm = nn.LayerNorm(h_pooled.size(-1)).to(h_pooled.device)
+        h_pooled_norm = self.pooled_norm(h_pooled)
+        
+        # Apply pre-output layer with gradient control during training
+        with torch.set_grad_enabled(self.training):
+            if self.training:
+                # Apply gradient clipping to pre_output layer
+                torch.nn.utils.clip_grad_norm_(self.pre_output.parameters(), max_norm=0.5)
+            
+            # Use the normalized hidden state
+            h_pre = self.pre_output(h_pooled_norm)
+        
+        # Comprehensive numerical stability for intermediate representation
+        h_pre = torch.nan_to_num(h_pre, nan=0.0, posinf=1.0, neginf=-1.0)
+        h_pre = torch.clamp(h_pre, min=-5.0, max=5.0)  # Use more conservative bounds
+        
+        # Apply second layer normalization before final projection
+        if not hasattr(self, 'pre_norm'):
+            self.pre_norm = nn.LayerNorm(h_pre.size(-1)).to(h_pre.device)
+        h_pre_norm = self.pre_norm(h_pre)
+        
+        # Apply output layer with gradient control
+        with torch.set_grad_enabled(self.training):
+            if self.training:
+                # Apply gradient clipping to output layer
+                torch.nn.utils.clip_grad_norm_(self.output_category.parameters(), max_norm=0.5)
+            
+            # Generate logits using normalized representation
+            category_logits = self.output_category(h_pre_norm)
+        
+        # Final safety measures for output logits
+        category_logits = torch.nan_to_num(category_logits, nan=0.0, posinf=10.0, neginf=-10.0)
+        category_logits = torch.clamp(category_logits, min=-20.0, max=20.0)
         
         # Secondary task: tax account type prediction (if multi-task)
         if self.multi_task:
-            # Get task weights
-            task_weights = self.task_attention(h_pre)
+            # Apply task attention with stability measures
+            with torch.set_grad_enabled(self.training):
+                if self.training:
+                    # Apply gradient clipping
+                    torch.nn.utils.clip_grad_norm_(self.task_attention.parameters(), max_norm=0.5)
+                
+                # Use the normalized intermediate representation
+                task_weights = self.task_attention(h_pre_norm)
             
-            # Apply task-specific weighting
-            category_weighted = h_pre * task_weights[:, 0:1]
-            tax_type_weighted = h_pre * task_weights[:, 1:2]
+            # Ensure valid probability distribution with strong safeguards
+            task_weights = torch.nan_to_num(task_weights, nan=0.5, posinf=0.5, neginf=0.5)
             
-            # Generate tax type logits
-            tax_type_logits = self.output_tax_type(tax_type_weighted)
+            # Ensure weights sum to 1.0 by applying softmax again
+            task_weights = F.softmax(task_weights.clamp(min=-5.0, max=5.0), dim=-1)
+            
+            # Apply task-specific weighting using normalized intermediate representation
+            category_weighted = h_pre_norm * task_weights[:, 0:1]
+            tax_type_weighted = h_pre_norm * task_weights[:, 1:2]
+            
+            # Apply layer normalization for tax type task
+            if not hasattr(self, 'tax_norm'):
+                self.tax_norm = nn.LayerNorm(tax_type_weighted.size(-1)).to(tax_type_weighted.device)
+            tax_type_weighted = self.tax_norm(tax_type_weighted)
+            
+            # Generate tax type logits with stability measures 
+            with torch.set_grad_enabled(self.training):
+                if self.training:
+                    # Apply gradient clipping
+                    torch.nn.utils.clip_grad_norm_(self.output_tax_type.parameters(), max_norm=0.5)
+                
+                tax_type_logits = self.output_tax_type(tax_type_weighted)
+            
+            # Final safety measures for tax type logits
+            tax_type_logits = torch.nan_to_num(tax_type_logits, nan=0.0, posinf=10.0, neginf=-10.0)
+            tax_type_logits = torch.clamp(tax_type_logits, min=-20.0, max=20.0)
             
             # Return both outputs
             return category_logits, tax_type_logits

@@ -701,26 +701,35 @@ class EnhancedHybridTransactionModel(nn.Module):
         # Build transaction relationship graph based on merchants, companies, etc.
         edge_index, edge_attr, edge_type = build_transaction_relationship_graph(df)
         
-        # Extract features
-        # This is a simplified placeholder - in practice you'd have more sophisticated
-        # feature extraction based on your data schema
+        # Extract features from the transaction data
+        # This is a comprehensive feature extraction based on transaction_data_batch schema
         features = []
+        
+        # ---- Numerical Features ----
         
         # Amount features
         if 'amount' in df.columns:
             amount = df['amount'].values
             amount_normalized = (amount - np.mean(amount)) / (np.std(amount) + 1e-8)
             features.append(amount_normalized)
-        
-        # Merchant features if available
+            
+            # Log amount (for skewed distributions)
+            log_amount = np.log1p(np.abs(amount)) * np.sign(amount)  # log(1+abs(x)) * sign(x)
+            features.append(log_amount)
+            
+        # User features
+        if 'user_id' in df.columns:
+            user_ids = pd.factorize(df['user_id'])[0]
+            user_ids_norm = user_ids / max(1, user_ids.max())
+            features.append(user_ids_norm)
+            
+        # Merchant features
         if 'merchant_id' in df.columns:
-            # Convert to categorical indices
             merchant_ids = pd.factorize(df['merchant_id'])[0]
-            # Normalize to [0, 1] range
             merchant_ids_norm = merchant_ids / max(1, merchant_ids.max())
             features.append(merchant_ids_norm)
-        
-        # Company features if available
+            
+        # Company features
         if 'company_id' in df.columns:
             company_ids = pd.factorize(df['company_id'])[0]
             company_ids_norm = company_ids / max(1, company_ids.max())
@@ -730,9 +739,143 @@ class EnhancedHybridTransactionModel(nn.Module):
             company_ids_tensor = torch.tensor(company_ids, dtype=torch.long)
         else:
             company_ids_tensor = None
+            
+        # Industry code
+        if 'industry_code' in df.columns:
+            industry_codes = df['industry_code'].values.astype(float)
+            industry_codes_norm = industry_codes / max(1, np.max(industry_codes))
+            features.append(industry_codes_norm)
+            
+        # Region ID
+        if 'region_id' in df.columns:
+            region_ids = df['region_id'].values.astype(float)
+            region_ids_norm = region_ids / max(1, np.max(region_ids))
+            features.append(region_ids_norm)
+            
+        # Language ID
+        if 'language_id' in df.columns:
+            language_ids = df['language_id'].values.astype(float)
+            language_ids_norm = language_ids / max(1, np.max(language_ids))
+            features.append(language_ids_norm)
+            
+        # Account type ID
+        if 'account_type_id' in df.columns:
+            account_type_ids = df['account_type_id'].values.astype(float)
+            account_type_ids_norm = account_type_ids / max(1, np.max(account_type_ids))
+            features.append(account_type_ids_norm)
+            
+        # Schedule C ID (tax schedule)
+        if 'scheduleC_id' in df.columns:
+            scheduleC_ids = df['scheduleC_id'].values.astype(float)
+            scheduleC_ids_norm = scheduleC_ids / max(1, np.max(scheduleC_ids))
+            features.append(scheduleC_ids_norm)
+            
+        # ---- Boolean Features ----
+            
+        # Is new user flag
+        if 'is_new_user' in df.columns:
+            is_new_user = df['is_new_user'].values.astype(float)
+            features.append(is_new_user)
+            
+        # Is before cutoff date
+        if 'is_before_cutoff_date' in df.columns:
+            is_before_cutoff = df['is_before_cutoff_date'].values.astype(float)
+            features.append(is_before_cutoff)
+            
+        # QBO accountant attached flag
+        if 'qbo_accountant_attached_current_flag' in df.columns:
+            qbo_accountant_flag = df['qbo_accountant_attached_current_flag'].values.astype(float)
+            features.append(qbo_accountant_flag)
+            
+        # QBO accountant ever attached
+        if 'qbo_accountant_attached_ever' in df.columns:
+            qbo_accountant_ever = df['qbo_accountant_attached_ever'].values.astype(float)
+            features.append(qbo_accountant_ever)
+            
+        # QBLive attach flag
+        if 'qblive_attach_flag' in df.columns:
+            qblive_flag = df['qblive_attach_flag'].values.astype(float)
+            features.append(qblive_flag)
+            
+        # ---- Categorical Features (One-Hot Encoded) ----
+            
+        # Transaction type
+        if 'transaction_type' in df.columns:
+            transaction_type_dummies = pd.get_dummies(df['transaction_type'])
+            for col in transaction_type_dummies.columns:
+                features.append(transaction_type_dummies[col].values)
+                
+        # QBO current product
+        if 'qbo_current_product' in df.columns:
+            qbo_product_dummies = pd.get_dummies(df['qbo_current_product'])
+            for col in qbo_product_dummies.columns:
+                features.append(qbo_product_dummies[col].values)
+                
+        # QBO signup type
+        if 'qbo_signup_type_desc' in df.columns:
+            qbo_signup_dummies = pd.get_dummies(df['qbo_signup_type_desc'])
+            for col in qbo_signup_dummies.columns:
+                features.append(qbo_signup_dummies[col].values)
+                
+        # Company model bucket
+        if 'company_model_bucket_name' in df.columns:
+            company_bucket_dummies = pd.get_dummies(df['company_model_bucket_name'])
+            for col in company_bucket_dummies.columns:
+                features.append(company_bucket_dummies[col].values)
+                
+        # Industry name
+        if 'industry_name' in df.columns:
+            industry_dummies = pd.get_dummies(df['industry_name'])
+            for col in industry_dummies.columns:
+                features.append(industry_dummies[col].values)
+                
+        # ---- Timestamp Features ----
+            
+        # Extract month and day of week from timestamps
+        for ts_col in ['books_create_timestamp', 'generated_timestamp', 'update_timestamp']:
+            if ts_col in df.columns:
+                try:
+                    # Ensure it's a datetime
+                    timestamps = pd.to_datetime(df[ts_col])
+                    
+                    # Month as cyclical feature (sin, cos encoding preserves cyclical nature)
+                    month = timestamps.dt.month.values.astype(float)
+                    month_sin = np.sin(2 * np.pi * month / 12)
+                    month_cos = np.cos(2 * np.pi * month / 12)
+                    features.append(month_sin)
+                    features.append(month_cos)
+                    
+                    # Day of week as cyclical feature
+                    day_of_week = timestamps.dt.dayofweek.values.astype(float)
+                    dow_sin = np.sin(2 * np.pi * day_of_week / 7)
+                    dow_cos = np.cos(2 * np.pi * day_of_week / 7)
+                    features.append(dow_sin)
+                    features.append(dow_cos)
+                    
+                    # Hour of day (if available with time component)
+                    if timestamps.dt.hour.max() > 0:
+                        hour = timestamps.dt.hour.values.astype(float)
+                        hour_sin = np.sin(2 * np.pi * hour / 24)
+                        hour_cos = np.cos(2 * np.pi * hour / 24)
+                        features.append(hour_sin)
+                        features.append(hour_cos)
+                except Exception as e:
+                    print(f"Error extracting timestamp features from {ts_col}: {str(e)}")
+                    pass
         
         # Combine features into a matrix
         feature_matrix = np.column_stack(features) if features else np.zeros((len(df), 1))
+        
+        # Print the number of features extracted
+        print(f"Extracted {feature_matrix.shape[1]} features from transaction data")
+        
+        # Ensure we have at least 128 features for the model's input projection
+        if feature_matrix.shape[1] < 128:
+            print(f"Padding feature matrix from {feature_matrix.shape[1]} to 128 dimensions")
+            padded_matrix = np.zeros((len(df), 128))
+            padded_matrix[:, :feature_matrix.shape[1]] = feature_matrix
+            feature_matrix = padded_matrix
+            
         node_features = torch.tensor(feature_matrix, dtype=torch.float)
         
         # Create sequence features from node features (simplified approach)
@@ -748,17 +891,52 @@ class EnhancedHybridTransactionModel(nn.Module):
                 idx = (start_idx + j) % len(df)
                 seq_features[i, j] = node_features[idx]
         
-        # Create timestamps (simplified)
-        if 'timestamp' in df.columns:
-            timestamps = df['timestamp'].values
-            if not isinstance(timestamps[0], (int, float)):
-                # Convert to seconds if datetime
-                timestamps = pd.to_datetime(timestamps).astype(int) / 10**9
-            timestamps_tensor = torch.tensor(timestamps[:batch_size * seq_len], dtype=torch.float)
-            timestamps_tensor = timestamps_tensor.view(batch_size, seq_len)
+        # Create timestamps with enhanced stability and error handling
+        if 'timestamp' in df.columns or 'books_create_timestamp' in df.columns or 'update_timestamp' in df.columns:
+            # Try multiple timestamp columns with fallbacks
+            for ts_col in ['timestamp', 'books_create_timestamp', 'update_timestamp', 'generated_timestamp']:
+                if ts_col in df.columns:
+                    try:
+                        # Convert to pandas datetime with error handling
+                        timestamps = pd.to_datetime(df[ts_col], errors='coerce')
+                        
+                        # Fill NaT values with median timestamp to avoid NaN propagation
+                        median_ts = timestamps.median()
+                        timestamps = timestamps.fillna(median_ts)
+                        
+                        # Convert to seconds since epoch (float)
+                        timestamps = timestamps.astype('int64') // 10**9  # Integer division for stability
+                        
+                        # Normalize to avoid extreme values
+                        min_ts = timestamps.min()
+                        timestamps = timestamps - min_ts  # Make relative to minimum
+                        
+                        # Check if we have enough timestamp values
+                        if len(timestamps) >= batch_size * seq_len:
+                            # We have enough timestamps, use them directly with safeguards
+                            timestamps_tensor = torch.tensor(timestamps[:batch_size * seq_len].values, 
+                                                          dtype=torch.float)
+                            timestamps_tensor = timestamps_tensor.view(batch_size, seq_len)
+                            
+                            # Apply final numerical safeguards
+                            timestamps_tensor = torch.nan_to_num(timestamps_tensor, nan=0.0)
+                            print(f"Using {ts_col} for timestamps")
+                            break
+                    except Exception as e:
+                        print(f"Error processing {ts_col}: {str(e)}. Trying next timestamp column.")
+                        continue
+            else:
+                # No valid timestamp column found or processed
+                print("No valid timestamp column found. Using synthetic timestamps.")
+                timestamps_tensor = torch.arange(batch_size * seq_len, dtype=torch.float).view(batch_size, seq_len)
         else:
-            # Create dummy timestamps
+            # Create synthetic timestamps with proper shape
+            print("No timestamp column found. Using synthetic timestamps.")
             timestamps_tensor = torch.arange(batch_size * seq_len, dtype=torch.float).view(batch_size, seq_len)
+        
+        # Final safety check - replace any remaining NaNs and extreme values
+        timestamps_tensor = torch.nan_to_num(timestamps_tensor, nan=0.0, posinf=1e5, neginf=0.0)
+        timestamps_tensor = torch.clamp(timestamps_tensor, min=0.0, max=1e5)
         
         # Create tabular features
         tabular_features = node_features[:batch_size].clone()

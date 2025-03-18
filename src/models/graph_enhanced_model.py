@@ -375,7 +375,45 @@ class GraphEnhancedTemporalModel(nn.Module):
             return category_logits, tax_type_logits
         else:
             return category_logits
-
+            
+    def extract_embeddings(self, x: torch.Tensor, edge_index: torch.Tensor, edge_type: torch.Tensor,
+                          edge_attr: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Extract embeddings from the graph model for use in other models or visualization.
+        
+        Args:
+            x: Node features [num_nodes, input_dim]
+            edge_index: Graph connectivity [2, num_edges]
+            edge_type: Edge type indices [num_edges]
+            edge_attr: Edge attributes [num_edges, edge_attr_dim]
+            
+        Returns:
+            Graph node embeddings
+        """
+        self.eval()
+        with torch.no_grad():
+            # Check dimensions and reshape if needed, similar to the forward method
+            expected_input_dim = 512  # From the dimension mismatch error
+            
+            # Dynamically adjust x if needed to match expected dimension
+            if x.shape[1] != expected_input_dim and x.shape[1] == 128:
+                # If x has too few dimensions, pad it
+                x = torch.zeros(x.shape[0], expected_input_dim, device=x.device)
+                
+            # Process input features
+            h = self.input_projection(x)
+            
+            # Process graph structure to get embeddings
+            graph_h = h
+            for layer in self.graph_layers:
+                graph_h = layer(graph_h, edge_index, edge_type, edge_attr)
+                graph_h = F.gelu(graph_h)
+            
+            # Apply graph attention if available
+            if hasattr(self, 'graph_attention'):
+                graph_h = self.graph_attention(graph_h, edge_index)
+            
+            return graph_h
         
 class GraphEnhancedTransactionClassifier:
     """

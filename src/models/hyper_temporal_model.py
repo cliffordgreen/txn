@@ -991,21 +991,21 @@ class HyperTemporalTransactionModel(nn.Module):
         
         # Input projections with flexible dimensions to handle mismatches
         self.graph_projection = nn.Sequential(
-            nn.Linear(self.graph_input_dim, hidden_dim),
+            nn.LazyLinear(hidden_dim),  # LazyLinear infers input dim at runtime
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout)
         )
         
         self.sequence_projection = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.LazyLinear(hidden_dim),  # LazyLinear infers input dim at runtime
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout)
         )
         
         self.tabular_projection = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.LazyLinear(hidden_dim),  # LazyLinear infers input dim at runtime
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout)
@@ -1013,7 +1013,7 @@ class HyperTemporalTransactionModel(nn.Module):
         
         # Company feature projection
         self.company_projection = nn.Sequential(
-            nn.Linear(self.company_input_dim, hidden_dim),
+            nn.LazyLinear(hidden_dim),  # LazyLinear infers input dim at runtime
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout)

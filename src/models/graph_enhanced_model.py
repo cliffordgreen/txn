@@ -139,7 +139,7 @@ class GraphEnhancedTemporalModel(nn.Module):
                  num_heads: int = 8, num_graph_layers: int = 2, num_temporal_layers: int = 2, 
                  dropout: float = 0.2, use_hyperbolic: bool = True, use_neural_ode: bool = False,
                  multi_task: bool = True, num_relations: int = 5, tax_type_output_dim: int = 20,
-                 company_input_dim: Optional[int] = None):
+                 company_input_dim: Optional[int] = None, graph_input_dim: Optional[int] = None):
         """
         Initialize the graph-enhanced temporal model.
         
@@ -147,6 +147,7 @@ class GraphEnhancedTemporalModel(nn.Module):
             input_dim: Dimension of input node features
             hidden_dim: Dimension of hidden features
             output_dim: Dimension of output features (num categories)
+            graph_input_dim: Dimension of graph input features (if different from input_dim)
             num_heads: Number of attention heads
             num_graph_layers: Number of graph layers
             num_temporal_layers: Number of temporal layers

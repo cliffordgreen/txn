@@ -21,6 +21,7 @@ import sys
 import time
 import glob
 import argparse
+import gc
 import numpy as np
 import pandas as pd
 import torch
@@ -28,6 +29,30 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.cuda.amp import autocast, GradScaler
 import matplotlib.pyplot as plt
+
+# Memory monitoring functions
+def get_memory_usage():
+    """Return current memory usage in MB"""
+    try:
+        import psutil
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        return memory_info.rss / 1024 / 1024  # Convert to MB
+    except ImportError:
+        # If psutil is not available, return -1
+        return -1
+
+def log_memory_usage(msg=""):
+    """Log memory usage for debugging"""
+    gc.collect()  # Force garbage collection
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    
+    current_usage = get_memory_usage()
+    gpu_memory = ""
+    if torch.cuda.is_available():
+        gpu_memory = f", GPU: {torch.cuda.memory_allocated() / 1024 / 1024:.1f} MB"
+    
+    print(f"MEMORY [{msg}]: RAM: {current_usage:.1f} MB{gpu_memory}")
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score, precision_score, recall_score, classification_report
@@ -100,42 +125,58 @@ class ParquetTransactionDataset(Dataset):
         self.preprocess_fn = preprocess_fn
         self.transform_fn = transform_fn
         
-        # Get total number of rows across all files
+        # More memory-efficient counting of rows
         self.file_row_counts = []
         self.total_rows = 0
         
+        import pyarrow.parquet as pq
+        # Default to a reasonable number if counting fails
+        if not parquet_files:
+            print("Warning: No parquet files provided to dataset")
+            self.total_rows = 0
+            self.lookup = []
+            return
+            
+        # Estimate row counts to avoid loading entire files
         for file in tqdm(parquet_files, desc="Counting rows"):
             try:
-                # Fastest method: Use PyArrow to read only file metadata
-                import pyarrow.parquet as pq
-                row_count = pq.read_metadata(file).num_rows
-            except Exception as e:
                 try:
-                    # Second fastest: Use pandas to read just a single column
-                    # Try common ID columns that are likely to exist
-                    for id_col in ['txn_id', 'id', 'transaction_id', 'index']:
-                        try:
-                            df = pd.read_parquet(file, columns=[id_col])
-                            row_count = len(df)  # Faster than .shape[0]
-                            break
-                        except:
-                            continue
+                    # Most memory-efficient: use PyArrow to read only metadata
+                    metadata = pq.read_metadata(file)
+                    row_count = metadata.num_rows
+                    
+                    # Handle case where metadata doesn't have row count
+                    if row_count == 0:
+                        # Try reading just the first row group's metadata
+                        if metadata.num_row_groups > 0:
+                            first_group = metadata.row_group(0)
+                            rows_per_group = first_group.num_rows
+                            row_count = rows_per_group * metadata.num_row_groups
+                except Exception as e:
+                    # If metadata approach fails, use a fixed sample size to estimate
+                    print(f"Metadata approach failed for {file}: {str(e)}")
+                    # Assume a reasonable default row count for initialization
+                    # We'll set a fixed count per file to avoid memory issues
+                    if 'transaction_data_batch' in file:
+                        # Training files tend to have ~500 rows each
+                        row_count = 500
                     else:
-                        # If none of the common ID columns worked, read just the first column
-                        df = pd.read_parquet(file)
-                        if df.columns.size > 0:
-                            first_col = df.columns[0]
-                            df = pd.read_parquet(file, columns=[first_col])
-                            row_count = len(df)
-                        else:
-                            raise ValueError(f"No columns found in file {file}")
-                except Exception as inner_e:
-                    print(f"Warning: Could not determine row count for {file}: {str(inner_e)}")
-                    print(f"Skipping file {file}")
-                    row_count = 0  # Mark as 0 rows so we can skip this file later
+                        # Smaller for other files
+                        row_count = 200
+                    print(f"Estimating {row_count} rows for {os.path.basename(file)}")
+            except Exception as e:
+                print(f"Warning: Could not determine row count for {file}: {str(e)}")
+                print(f"Using default row count")
+                row_count = 100  # Small default to prevent memory issues
             
             self.file_row_counts.append(row_count)
             self.total_rows += row_count
+            
+        # If total rows is still 0, set a reasonable default
+        if self.total_rows == 0:
+            print("Warning: Could not determine row count for any files. Using default.")
+            self.total_rows = 1000
+            self.file_row_counts = [1000 // len(parquet_files)] * len(parquet_files)
             
         # Build lookup table more efficiently using _build_lookup
         self.lookup = self._build_lookup()
@@ -278,47 +319,79 @@ class ParquetTransactionDataset(Dataset):
             return pd.DataFrame()
         
     def get_sample_batch(self, sample_size=100):
-        """Get a small sample batch for metadata and model initialization"""
-        print(f"Getting sample batch of {sample_size} rows...")
+        """Get a small sample batch for metadata and model initialization using a memory-efficient approach"""
+        print(f"Getting sample batch of {sample_size} rows with memory-efficient approach...")
         
-        # Use a small sample size to avoid memory issues
-        sample_size = min(sample_size, self.total_rows)
+        # Use a very small sample size to avoid memory issues
+        sample_size = min(20, sample_size, self.total_rows)  # Strict limit of 20 rows
         
-        # Sample evenly across files
-        rows_per_file = max(1, sample_size // len(self.parquet_files))
-        
-        sample_dfs = []
-        
-        for file_idx, file_path in enumerate(self.parquet_files):
-            if file_idx >= len(self.file_row_counts):
-                continue
-                
-            row_count = self.file_row_counts[file_idx]
-            if row_count == 0:
-                continue
-                
-            # Sample rows from this file
-            try:
-                # Try to read just a few rows from the start of the file
-                sample_rows = min(rows_per_file, row_count)
-                file_df = pd.read_parquet(file_path, engine='pyarrow').head(sample_rows)
-                
-                if self.preprocess_fn:
-                    file_df = self.preprocess_fn(file_df)
-                    
-                sample_dfs.append(file_df)
-                
-                # Stop if we have enough samples
-                if sum(len(df) for df in sample_dfs) >= sample_size:
-                    break
-            except Exception as e:
-                print(f"Error sampling from {file_path}: {str(e)}")
-                continue
-                
-        if not sample_dfs:
-            raise ValueError("Could not get any sample data from the dataset")
+        # We'll only use the first file to avoid loading too much
+        if not self.parquet_files:
+            raise ValueError("No parquet files available for sampling")
             
-        return pd.concat(sample_dfs, ignore_index=True)
+        file_path = self.parquet_files[0]
+        
+        try:
+            # Use PyArrow for the most controlled memory usage
+            import pyarrow.parquet as pq
+            
+            # First get the schema to check for columns
+            schema = pq.read_schema(file_path)
+            columns = schema.names
+            
+            # Identify the key column we need
+            target_cols = ['category_id']
+            if 'tax_type_id' in columns:
+                target_cols.append('tax_type_id')
+                
+            # Add a few columns that might be useful for debugging
+            for extra_col in ['txn_id', 'merchant_id', 'amount']:
+                if extra_col in columns:
+                    target_cols.append(extra_col)
+                    
+            # Limit to no more than 5 columns total to minimize memory
+            target_cols = target_cols[:5]
+            
+            # Read only these columns and only the first few rows
+            try:
+                # Safest: most constrained reading approach
+                table = pq.read_table(file_path, columns=target_cols, num_rows=sample_size)
+                sample_df = table.to_pandas()
+                print(f"Successfully read {len(sample_df)} rows with {len(target_cols)} columns")
+                
+                # Apply preprocessing if needed - but with caution
+                if self.preprocess_fn:
+                    try:
+                        sample_df = self.preprocess_fn(sample_df)
+                    except Exception as e:
+                        print(f"Error in preprocessing sample: {str(e)}")
+                        # Continue with unprocessed data
+                
+                return sample_df
+                
+            except Exception as e:
+                print(f"Error with PyArrow targeted read: {str(e)}")
+                # Fall through to pandas approach
+                
+        except Exception as e:
+            print(f"Error with PyArrow setup: {str(e)}")
+            
+        # Fallback to pandas with strict constraints
+        try:
+            # Hardcode minimal column selection
+            try:
+                sample_df = pd.read_parquet(file_path, engine='pyarrow', columns=['category_id'], nrows=10)
+            except:
+                # If that fails, try without column selection
+                sample_df = pd.read_parquet(file_path, engine='pyarrow', nrows=5)
+                
+            print(f"Fallback read {len(sample_df)} rows with pandas")
+            return sample_df
+            
+        except Exception as e:
+            print(f"All sampling methods failed: {str(e)}")
+            # Return empty DataFrame as last resort
+            return pd.DataFrame({'category_id': [0, 1, 2, 3, 4]})
         
     def get_batch_df(self, indices):
         """Get a batch of rows as a single DataFrame with improved error handling and performance"""
@@ -1967,42 +2040,95 @@ def main():
         
         # Create datasets with progress reporting
         print("\n🔄 Creating datasets...")
+        log_memory_usage("before dataset creation")
+        
         train_dataset = ParquetTransactionDataset(train_files, preprocess_fn=preprocess_transactions)
+        log_memory_usage("after train dataset creation")
+        
         val_dataset = ParquetTransactionDataset(val_files, preprocess_fn=preprocess_transactions)
+        log_memory_usage("after validation dataset creation")
         
         print(f"✓ Train dataset: {len(train_dataset):,} transactions")
         print(f"✓ Validation dataset: {len(val_dataset):,} transactions")
         
         # Sample a small batch to get metadata and schema
         print("\n🔍 Analyzing dataset schema...")
+        log_memory_usage("before schema analysis")
+        
+        # Default values in case sampling fails
+        num_categories = 400
+        num_tax_types = 20
+        
         try:
-            sample_df = train_dataset.get_sample_batch(sample_size=100)
+            print("Getting sample batch of 100 rows with low memory approach...")
+            # Clear memory before sample batch loading
+            gc.collect()
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
             
-            # Display schema analysis
-            print("\nDataset Schema:")
-            for col in sample_df.columns:
-                non_null = sample_df[col].count()
-                null_pct = (len(sample_df) - non_null) / len(sample_df) * 100
-                unique_values = sample_df[col].nunique()
-                dtype = sample_df[col].dtype
+            # If we have train files, read a very small sample from just one file
+            if train_files:
+                # Get the first file
+                sample_file = train_files[0]
+                print(f"Reading schema from first file: {os.path.basename(sample_file)}")
                 
-                print(f"  - {col}: {dtype}, {non_null}/{len(sample_df)} non-null ({null_pct:.1f}% missing), {unique_values} unique values")
-            
-            # Get category and tax type counts for model initialization
-            num_categories = sample_df['category_id'].nunique() if 'category_id' in sample_df.columns else 0
-            num_tax_types = sample_df['tax_type_id'].nunique() if 'tax_type_id' in sample_df.columns else 1
+                # Read minimal data - reduced columns and row count first to analyze memory usage
+                try:
+                    # Use PyArrow direct API for better memory control
+                    import pyarrow.parquet as pq
+                    
+                    # First just get the schema without loading data
+                    parquet_schema = pq.read_schema(sample_file)
+                    print(f"File has {len(parquet_schema.names)} columns")
+                    
+                    # Read just a few rows first to be cautious
+                    table = pq.read_table(sample_file, columns=['category_id', 'tax_type_id'] if 'category_id' in parquet_schema.names else None, rows=10)
+                    small_sample_df = table.to_pandas()
+                    print(f"Successfully read {len(small_sample_df)} rows for schema analysis")
+                    
+                    # Show how many categories we have from the small sample
+                    if 'category_id' in small_sample_df.columns:
+                        num_small_categories = small_sample_df['category_id'].nunique()
+                        print(f"Small sample contains {num_small_categories} unique categories")
+                        
+                        # If we need more categories, try a larger sample
+                        if num_small_categories < 10 and len(small_sample_df) < 100:
+                            print("Small sample has few categories, trying to read more rows...")
+                            try:
+                                # Try to read up to 100 rows
+                                table = pq.read_table(sample_file, columns=['category_id', 'tax_type_id'], rows=100)
+                                sample_df = table.to_pandas()
+                                num_categories = sample_df['category_id'].nunique() if 'category_id' in sample_df.columns else 400
+                                num_tax_types = sample_df['tax_type_id'].nunique() if 'tax_type_id' in sample_df.columns else 20
+                            except Exception as e:
+                                print(f"Error reading larger sample: {str(e)}")
+                        else:
+                            # Use values from small sample
+                            num_categories = num_small_categories if 'category_id' in small_sample_df.columns else 400
+                            num_tax_types = small_sample_df['tax_type_id'].nunique() if 'tax_type_id' in small_sample_df.columns else 20
+                    
+                    print("Partial schema analysis (based on limited columns):")
+                    for col in small_sample_df.columns:
+                        print(f"  - {col}: {small_sample_df[col].dtype}")
+                
+                except Exception as e:
+                    print(f"Error with PyArrow approach: {str(e)}")
+                    print("Trying alternate method with Pandas...")
+                    
+                    try:
+                        # Fallback to pandas with strict constraints
+                        sample_df = pd.read_parquet(sample_file, engine='pyarrow', columns=['category_id', 'tax_type_id'], nrows=50)
+                        
+                        # Get counts
+                        num_categories = sample_df['category_id'].nunique() if 'category_id' in sample_df.columns else 400
+                        num_tax_types = sample_df['tax_type_id'].nunique() if 'tax_type_id' in sample_df.columns else 20
+                    except Exception as e2:
+                        print(f"Error with pandas approach: {str(e2)}")
+                        print("Using default values")
+            else:
+                print("No training files available for schema analysis")
             
             print(f"\n✓ Number of unique categories: {num_categories}")
             print(f"✓ Number of unique tax types: {num_tax_types}")
-            
-            # If no categories were found in the sample, use reasonable defaults
-            if num_categories == 0:
-                print("⚠️ Warning: No categories found in sample. Using default value of 400.")
-                num_categories = 400
-            
-            if num_tax_types == 0:
-                print("⚠️ Warning: No tax types found in sample. Using default value of 20.")
-                num_tax_types = 20
                 
         except Exception as e:
             print(f"⚠️ Error analyzing sample data: {str(e)}")
@@ -2013,7 +2139,14 @@ def main():
         # Model initialization phase
         print("\n🧠 Model Initialization Phase")
         print("-" * 40)
+        log_memory_usage("before model initialization")
+        
+        # Clear memory before model creation
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
         model = initialize_model(config.hidden_dim, num_categories, num_tax_types, config, device)
+        log_memory_usage("after model initialization")
         
         # Count parameters
         total_params = sum(p.numel() for p in model.parameters())

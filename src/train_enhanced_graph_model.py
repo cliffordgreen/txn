@@ -88,6 +88,12 @@ class Config:
     log_steps = 10
 
 
+# Define a custom collate function for the DataLoader to handle DataFrames
+def df_collate_fn(batch):
+    # Just return batch indices
+    return list(range(len(batch)))
+
+
 class ParquetTransactionDataset(Dataset):
     def __init__(self, parquet_files, preprocess_fn=None, transform_fn=None):
         self.parquet_files = parquet_files
@@ -388,60 +394,73 @@ def evaluate(model, dataloader, dataset, device, cuda_graph=None):
     
     with torch.no_grad():
         for batch_indices in tqdm(dataloader, desc="Evaluation", leave=False):
-            # Get batch dataframe
-            batch_df = dataset.get_batch_df(batch_indices)
-            
-            # Prepare inputs
-            data, labels = prepare_model_inputs(batch_df, model, device)
-            
-            # Forward pass
-            if cuda_graph is not None and config.use_cuda_graphs:
-                # Use CUDA graph for faster inference
-                outputs = run_with_cuda_graph(cuda_graph, data)
-            else:
-                # Regular forward pass
-                outputs = model(
-                    x=data['x'],
-                    edge_index=data['edge_index'],
-                    edge_type=data['edge_type'],
-                    edge_attr=data['edge_attr'],
-                    seq_features=data['seq_features'],
-                    timestamps=data['timestamps'],
-                    tabular_features=data['tabular_features'],
-                    t0=data['t0'],
-                    t1=data['t1'],
-                    company_features=data['company_features'],
-                    company_ids=data['company_ids'],
-                    batch_size=data['batch_size'],
-                    seq_len=data['seq_len']
-                )
-            
-            # Compute loss
-            if isinstance(outputs, tuple):
-                category_logits, tax_type_logits = outputs
-                category_loss = nn.CrossEntropyLoss()(category_logits, labels['category'])
+            # Handle the case where batch_indices is a range of indices from our custom collate_fn
+            if len(batch_indices) > 0:
+                start_idx = batch_indices[0]
+                end_idx = start_idx + len(batch_indices)
+                actual_indices = list(range(start_idx, min(end_idx, len(dataset))))
                 
-                if 'tax_type' in labels:
-                    tax_type_loss = nn.CrossEntropyLoss()(tax_type_logits, labels['tax_type'])
-                    loss = 0.7 * category_loss + 0.3 * tax_type_loss
-                else:
-                    loss = category_loss
+                try:
+                    # Get batch dataframe
+                    batch_df = dataset.get_batch_df(actual_indices)
                     
-                # Compute accuracy
-                preds = category_logits.argmax(dim=1)
-                acc = (preds == labels['category']).float().mean().item()
-            else:
-                # Single task model
-                loss = nn.CrossEntropyLoss()(outputs, labels['category'])
-                preds = outputs.argmax(dim=1)
-                acc = (preds == labels['category']).float().mean().item()
-            
-            # Update metrics
-            total_loss += loss.item() * len(batch_indices)
-            total_acc += acc * len(batch_indices)
-            samples_processed += len(batch_indices)
+                    # Prepare inputs
+                    data, labels = prepare_model_inputs(batch_df, model, device)
+                    
+                    # Forward pass
+                    if cuda_graph is not None and config.use_cuda_graphs:
+                        # Use CUDA graph for faster inference
+                        outputs = run_with_cuda_graph(cuda_graph, data)
+                    else:
+                        # Regular forward pass
+                        outputs = model(
+                            x=data['x'],
+                            edge_index=data['edge_index'],
+                            edge_type=data['edge_type'],
+                            edge_attr=data['edge_attr'],
+                            seq_features=data['seq_features'],
+                            timestamps=data['timestamps'],
+                            tabular_features=data['tabular_features'],
+                            t0=data['t0'],
+                            t1=data['t1'],
+                            company_features=data['company_features'],
+                            company_ids=data['company_ids'],
+                            batch_size=data['batch_size'],
+                            seq_len=data['seq_len']
+                        )
+                    
+                    # Compute loss
+                    if isinstance(outputs, tuple):
+                        category_logits, tax_type_logits = outputs
+                        category_loss = nn.CrossEntropyLoss()(category_logits, labels['category'])
+                        
+                        if 'tax_type' in labels:
+                            tax_type_loss = nn.CrossEntropyLoss()(tax_type_logits, labels['tax_type'])
+                            loss = 0.7 * category_loss + 0.3 * tax_type_loss
+                        else:
+                            loss = category_loss
+                            
+                        # Compute accuracy
+                        preds = category_logits.argmax(dim=1)
+                        acc = (preds == labels['category']).float().mean().item()
+                    else:
+                        # Single task model
+                        loss = nn.CrossEntropyLoss()(outputs, labels['category'])
+                        preds = outputs.argmax(dim=1)
+                        acc = (preds == labels['category']).float().mean().item()
+                    
+                    # Update metrics
+                    total_loss += loss.item() * len(actual_indices)
+                    total_acc += acc * len(actual_indices)
+                    samples_processed += len(actual_indices)
+                except Exception as e:
+                    print(f"Error in evaluation batch: {str(e)}")
+                    continue
     
     # Calculate average metrics
+    if samples_processed == 0:
+        return float('inf'), 0.0
+    
     avg_loss = total_loss / samples_processed
     avg_acc = total_acc / samples_processed
     
@@ -450,6 +469,10 @@ def evaluate(model, dataloader, dataset, device, cuda_graph=None):
 
 def train(model, train_dataset, val_dataset, config, device):
     """Train the model with the given datasets"""
+    print(f"Starting training with batch size {config.batch_size}")
+    print(f"Training dataset size: {len(train_dataset)}")
+    print(f"Validation dataset size: {len(val_dataset)}")
+    
     # Create optimizer
     optimizer = optim.AdamW(
         model.parameters(),
@@ -474,9 +497,9 @@ def train(model, train_dataset, val_dataset, config, device):
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        num_workers=config.num_workers,
-        prefetch_factor=config.prefetch_factor,
-        pin_memory=True
+        num_workers=0,  # Disable multiprocessing for now
+        pin_memory=True,
+        collate_fn=df_collate_fn
     )
     
     # Create validation dataloader
@@ -484,9 +507,9 @@ def train(model, train_dataset, val_dataset, config, device):
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
-        num_workers=config.num_workers,
-        prefetch_factor=config.prefetch_factor,
-        pin_memory=True
+        num_workers=0,  # Disable multiprocessing for now
+        pin_memory=True,
+        collate_fn=df_collate_fn
     )
     
     # Initialize metrics tracking
@@ -518,18 +541,71 @@ def train(model, train_dataset, val_dataset, config, device):
         pbar = tqdm(enumerate(train_loader), total=len(train_loader))
         
         for step, batch_indices in pbar:
-            # Get batch dataframe
-            batch_df = train_dataset.get_batch_df(batch_indices)
-            
-            # Prepare inputs
-            data, labels = prepare_model_inputs(batch_df, model, device)
-            
-            # Zero gradients
-            optimizer.zero_grad()
-            
-            # Forward pass with mixed precision
-            if config.use_amp:
-                with autocast():
+            # Handle empty batches
+            if len(batch_indices) == 0:
+                continue
+                
+            try:
+                # Handle the case where batch_indices is a list of indices from our custom collate_fn
+                start_idx = batch_indices[0] 
+                end_idx = start_idx + len(batch_indices)
+                actual_indices = list(range(start_idx, min(end_idx, len(train_dataset))))
+                
+                # Get batch dataframe
+                batch_df = train_dataset.get_batch_df(actual_indices)
+                
+                # Prepare inputs
+                data, labels = prepare_model_inputs(batch_df, model, device)
+                
+                # Zero gradients
+                optimizer.zero_grad()
+                
+                # Forward pass with mixed precision
+                if config.use_amp:
+                    with autocast():
+                        outputs = model(
+                            x=data['x'],
+                            edge_index=data['edge_index'],
+                            edge_type=data['edge_type'],
+                            edge_attr=data['edge_attr'],
+                            seq_features=data['seq_features'],
+                            timestamps=data['timestamps'],
+                            tabular_features=data['tabular_features'],
+                            t0=data['t0'],
+                            t1=data['t1'],
+                            company_features=data['company_features'],
+                            company_ids=data['company_ids'],
+                            batch_size=data['batch_size'],
+                            seq_len=data['seq_len']
+                        )
+                        
+                        # Compute loss
+                        if isinstance(outputs, tuple):
+                            category_logits, tax_type_logits = outputs
+                            category_loss = nn.CrossEntropyLoss()(category_logits, labels['category'])
+                            
+                            if 'tax_type' in labels:
+                                tax_type_loss = nn.CrossEntropyLoss()(tax_type_logits, labels['tax_type'])
+                                loss = 0.7 * category_loss + 0.3 * tax_type_loss
+                            else:
+                                loss = category_loss
+                                
+                            # Compute accuracy
+                            preds = category_logits.argmax(dim=1)
+                            acc = (preds == labels['category']).float().mean().item()
+                        else:
+                            # Single task model
+                            loss = nn.CrossEntropyLoss()(outputs, labels['category'])
+                            preds = outputs.argmax(dim=1)
+                            acc = (preds == labels['category']).float().mean().item()
+                        
+                    # Backward and optimize with mixed precision
+                    scaler.scale(loss).backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    # Without mixed precision
                     outputs = model(
                         x=data['x'],
                         edge_index=data['edge_index'],
@@ -566,93 +642,53 @@ def train(model, train_dataset, val_dataset, config, device):
                         preds = outputs.argmax(dim=1)
                         acc = (preds == labels['category']).float().mean().item()
                     
-                # Backward and optimize with mixed precision
-                scaler.scale(loss).backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                # Without mixed precision
-                outputs = model(
-                    x=data['x'],
-                    edge_index=data['edge_index'],
-                    edge_type=data['edge_type'],
-                    edge_attr=data['edge_attr'],
-                    seq_features=data['seq_features'],
-                    timestamps=data['timestamps'],
-                    tabular_features=data['tabular_features'],
-                    t0=data['t0'],
-                    t1=data['t1'],
-                    company_features=data['company_features'],
-                    company_ids=data['company_ids'],
-                    batch_size=data['batch_size'],
-                    seq_len=data['seq_len']
-                )
+                    # Backward and optimize
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                    optimizer.step()
                 
-                # Compute loss
-                if isinstance(outputs, tuple):
-                    category_logits, tax_type_logits = outputs
-                    category_loss = nn.CrossEntropyLoss()(category_logits, labels['category'])
+                # Update metrics
+                epoch_loss += loss.item() * len(actual_indices)
+                epoch_acc += acc * len(actual_indices)
+                samples_processed += len(actual_indices)
+                
+                # Update progress bar
+                if step % config.log_steps == 0:
+                    pbar.set_description(
+                        f"Train Loss: {epoch_loss / max(1, samples_processed):.4f}, "
+                        f"Acc: {epoch_acc / max(1, samples_processed):.4f}"
+                    )
+                
+                # Validation during epoch
+                if step > 0 and step % config.eval_steps == 0:
+                    # Switch to eval mode
+                    model.eval()
                     
-                    if 'tax_type' in labels:
-                        tax_type_loss = nn.CrossEntropyLoss()(tax_type_logits, labels['tax_type'])
-                        loss = 0.7 * category_loss + 0.3 * tax_type_loss
-                    else:
-                        loss = category_loss
-                        
-                    # Compute accuracy
-                    preds = category_logits.argmax(dim=1)
-                    acc = (preds == labels['category']).float().mean().item()
-                else:
-                    # Single task model
-                    loss = nn.CrossEntropyLoss()(outputs, labels['category'])
-                    preds = outputs.argmax(dim=1)
-                    acc = (preds == labels['category']).float().mean().item()
-                
-                # Backward and optimize
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-                optimizer.step()
-            
-            # Update metrics
-            epoch_loss += loss.item() * len(batch_indices)
-            epoch_acc += acc * len(batch_indices)
-            samples_processed += len(batch_indices)
-            
-            # Update progress bar
-            if step % config.log_steps == 0:
-                pbar.set_description(
-                    f"Train Loss: {epoch_loss / samples_processed:.4f}, "
-                    f"Acc: {epoch_acc / samples_processed:.4f}"
-                )
-            
-            # Validation during epoch
-            if step > 0 and step % config.eval_steps == 0:
-                # Switch to eval mode
-                model.eval()
-                
-                # Initialize CUDA graph for faster inference if needed
-                if config.use_cuda_graphs and cuda_graph is None and torch.cuda.is_available():
-                    cuda_graph = create_cuda_graph(model, data)
-                
-                val_loss, val_acc = evaluate(model, val_loader, val_dataset, device, cuda_graph)
-                
-                print(f"Step {step}/{len(train_loader)}, "
-                      f"Train Loss: {epoch_loss / samples_processed:.4f}, "
-                      f"Train Acc: {epoch_acc / samples_processed:.4f}, "
-                      f"Val Loss: {val_loss:.4f}, "
-                      f"Val Acc: {val_acc:.4f}")
-                
-                # Switch back to train mode
-                model.train()
+                    # Initialize CUDA graph for faster inference if needed
+                    if config.use_cuda_graphs and cuda_graph is None and torch.cuda.is_available():
+                        cuda_graph = create_cuda_graph(model, data)
+                    
+                    val_loss, val_acc = evaluate(model, val_loader, val_dataset, device, cuda_graph)
+                    
+                    print(f"Step {step}/{len(train_loader)}, "
+                        f"Train Loss: {epoch_loss / max(1, samples_processed):.4f}, "
+                        f"Train Acc: {epoch_acc / max(1, samples_processed):.4f}, "
+                        f"Val Loss: {val_loss:.4f}, "
+                        f"Val Acc: {val_acc:.4f}")
+                    
+                    # Switch back to train mode
+                    model.train()
+            except Exception as e:
+                print(f"Error in training batch: {str(e)}")
+                continue
         
         # End of epoch evaluation
         model.eval()
         val_loss, val_acc = evaluate(model, val_loader, val_dataset, device, cuda_graph)
         
         # Calculate epoch metrics
-        train_loss = epoch_loss / samples_processed
-        train_acc = epoch_acc / samples_processed
+        train_loss = epoch_loss / max(1, samples_processed)
+        train_acc = epoch_acc / max(1, samples_processed)
         
         # Update learning rate
         scheduler.step(val_loss)
@@ -732,32 +768,50 @@ def extract_embeddings_for_xgboost(model, dataset, output_file, config, device):
     labels_list = []
     transaction_ids = []
     
+    # Create dataloader with smaller batch size for embedding extraction
+    batch_size = min(config.batch_size, 32)
     dataloader = DataLoader(
         dataset,
-        batch_size=config.batch_size,
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=config.num_workers,
-        prefetch_factor=config.prefetch_factor,
-        pin_memory=True
+        num_workers=0,
+        pin_memory=True,
+        collate_fn=df_collate_fn
     )
     
     with torch.no_grad():
         for batch_indices in tqdm(dataloader, desc="Extracting embeddings"):
-            # Get batch dataframe
-            batch_df = dataset.get_batch_df(batch_indices)
-            
-            # Prepare inputs
-            data, labels = prepare_model_inputs(batch_df, model, device)
-            
-            # Extract embeddings
-            embeddings = model.extract_embeddings(data)
-            
-            # Store embeddings and labels
-            embeddings_list.append(embeddings.cpu().numpy())
-            labels_list.append(labels['category'].cpu().numpy())
-            
-            if 'txn_id' in batch_df.columns:
-                transaction_ids.extend(batch_df['txn_id'].tolist())
+            try:
+                if len(batch_indices) == 0:
+                    continue
+                    
+                # Handle the case where batch_indices is a list of indices
+                start_idx = batch_indices[0]
+                end_idx = start_idx + len(batch_indices)
+                actual_indices = list(range(start_idx, min(end_idx, len(dataset))))
+                
+                # Get batch dataframe
+                batch_df = dataset.get_batch_df(actual_indices)
+                
+                # Prepare inputs
+                data, labels = prepare_model_inputs(batch_df, model, device)
+                
+                # Extract embeddings
+                embeddings = model.extract_embeddings(data)
+                
+                # Store embeddings and labels
+                embeddings_list.append(embeddings.cpu().numpy())
+                labels_list.append(labels['category'].cpu().numpy())
+                
+                if 'txn_id' in batch_df.columns:
+                    transaction_ids.extend(batch_df['txn_id'].tolist())
+            except Exception as e:
+                print(f"Error extracting embeddings for batch: {str(e)}")
+                continue
+    
+    if not embeddings_list:
+        print("No embeddings were extracted.")
+        return None
     
     # Concatenate embeddings and labels
     embeddings_array = np.vstack(embeddings_list)
@@ -870,7 +924,8 @@ def configure_for_hardware(config):
         config.hidden_dim = 64
         config.use_amp = False
         config.use_cuda_graphs = False
-        config.num_workers = 2
+        config.num_workers = 0  # No parallel workers for CPU
+        config.prefetch_factor = None
         
     # Ensure cuda_graph_batch_size is set
     config.cuda_graph_batch_size = config.batch_size
@@ -929,89 +984,93 @@ def main():
         if not key.startswith('__'):
             print(f"{key}: {value}")
     
-    # Get parquet files
-    parquet_files = get_parquet_files(config.data_dir, config.max_files)
-    
-    if not parquet_files:
-        raise ValueError(f"No parquet files found in {config.data_dir}")
-    
-    # Split files into train and validation sets
-    train_files, val_files = train_test_split(parquet_files, test_size=0.2, random_state=42)
-    print(f"Training on {len(train_files)} files, validating on {len(val_files)} files")
-    
-    # Create datasets
-    train_dataset = ParquetTransactionDataset(train_files, preprocess_fn=preprocess_transactions)
-    val_dataset = ParquetTransactionDataset(val_files, preprocess_fn=preprocess_transactions)
-    
-    print(f"Train dataset: {len(train_dataset)} transactions")
-    print(f"Validation dataset: {len(val_dataset)} transactions")
-    
-    # Sample a small batch to get category and tax type counts
-    print("Getting metadata from sample batch...")
-    sample_df = train_dataset.get_sample_batch(sample_size=100)
-    
-    num_categories = sample_df['category_id'].nunique() if 'category_id' in sample_df.columns else 0
-    num_tax_types = sample_df['tax_type_id'].nunique() if 'tax_type_id' in sample_df.columns else 1
-    
-    print(f"Number of unique categories: {num_categories}")
-    print(f"Number of unique tax types: {num_tax_types}")
-    
-    # If no categories were found in the sample, use reasonable defaults
-    if num_categories == 0:
-        print("Warning: No categories found in sample. Using default value of 400.")
-        num_categories = 400
-    
-    if num_tax_types == 0:
-        print("Warning: No tax types found in sample. Using default value of 20.")
-        num_tax_types = 20
-    
-    # Initialize model
-    model = initialize_model(config.hidden_dim, num_categories, num_tax_types, config, device)
-    print(model)
-    
-    # Train the model
-    start_time = time.time()
-    training_history = train(model, train_dataset, val_dataset, config, device)
-    end_time = time.time()
-    
-    print(f"Training completed in {(end_time - start_time) / 60:.2f} minutes")
-    print(f"Best epoch: {training_history['best_epoch'] + 1} with validation loss {training_history['best_val_loss']:.4f}")
-    
-    # Plot training curves
-    plot_training_curves(training_history, config)
-    
-    # Load best model
-    checkpoint = torch.load(os.path.join(config.output_dir, 'best_model.pt'))
-    model.load_state_dict(checkpoint['model_state_dict'])
-    print(f"Loaded best model from epoch {checkpoint['epoch'] + 1} with validation loss {checkpoint['val_loss']:.4f}")
-    
-    # Extract embeddings for XGBoost if requested
-    if config.extract_embeddings:
-        print("Extracting embeddings for XGBoost integration...")
-        embeddings_df = extract_embeddings_for_xgboost(model, train_dataset, config.embedding_output_file, config, device)
-        
-        # Show embedding dimensions
-        embedding_cols = [col for col in embeddings_df.columns if col.startswith('embedding_')]
-        print(f"\nEmbedding dimension: {len(embedding_cols)}")
-    
-    # Memory analysis
-    if torch.cuda.is_available():
-        print("\nGPU Memory Analysis:")
-        print(f"Peak Memory Allocated: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
-        print(f"Peak Memory Reserved: {torch.cuda.max_memory_reserved() / 1e9:.2f} GB")
-        print(f"Memory Allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-        print(f"Memory Reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
-        
-        # Reset peak stats
-        torch.cuda.reset_peak_memory_stats()
-    
-    print("\nTraining completed successfully!")
-
-
-if __name__ == "__main__":
     try:
-        main()
+        # Get parquet files
+        parquet_files = get_parquet_files(config.data_dir, config.max_files)
+        
+        if not parquet_files:
+            raise ValueError(f"No parquet files found in {config.data_dir}")
+        
+        # Split files into train and validation sets
+        train_files, val_files = train_test_split(parquet_files, test_size=0.2, random_state=42)
+        print(f"Training on {len(train_files)} files, validating on {len(val_files)} files")
+        
+        # Create datasets
+        train_dataset = ParquetTransactionDataset(train_files, preprocess_fn=preprocess_transactions)
+        val_dataset = ParquetTransactionDataset(val_files, preprocess_fn=preprocess_transactions)
+        
+        print(f"Train dataset: {len(train_dataset)} transactions")
+        print(f"Validation dataset: {len(val_dataset)} transactions")
+        
+        # Sample a small batch to get category and tax type counts
+        print("Getting metadata from sample batch...")
+        sample_df = train_dataset.get_sample_batch(sample_size=100)
+        
+        num_categories = sample_df['category_id'].nunique() if 'category_id' in sample_df.columns else 0
+        num_tax_types = sample_df['tax_type_id'].nunique() if 'tax_type_id' in sample_df.columns else 1
+        
+        print(f"Number of unique categories: {num_categories}")
+        print(f"Number of unique tax types: {num_tax_types}")
+        
+        # If no categories were found in the sample, use reasonable defaults
+        if num_categories == 0:
+            print("Warning: No categories found in sample. Using default value of 400.")
+            num_categories = 400
+        
+        if num_tax_types == 0:
+            print("Warning: No tax types found in sample. Using default value of 20.")
+            num_tax_types = 20
+        
+        # Initialize model
+        model = initialize_model(config.hidden_dim, num_categories, num_tax_types, config, device)
+        print(model)
+        
+        # Train the model
+        start_time = time.time()
+        training_history = train(model, train_dataset, val_dataset, config, device)
+        end_time = time.time()
+        
+        print(f"Training completed in {(end_time - start_time) / 60:.2f} minutes")
+        print(f"Best epoch: {training_history['best_epoch'] + 1} with validation loss {training_history['best_val_loss']:.4f}")
+        
+        # Plot training curves
+        plot_training_curves(training_history, config)
+        
+        # Load best model
+        best_model_path = os.path.join(config.output_dir, 'best_model.pt')
+        if os.path.exists(best_model_path):
+            checkpoint = torch.load(best_model_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"Loaded best model from epoch {checkpoint['epoch'] + 1} with validation loss {checkpoint['val_loss']:.4f}")
+        
+            # Extract embeddings for XGBoost if requested
+            if config.extract_embeddings:
+                print("Extracting embeddings for XGBoost integration...")
+                embeddings_df = extract_embeddings_for_xgboost(model, train_dataset, config.embedding_output_file, config, device)
+                
+                if embeddings_df is not None:
+                    # Show embedding dimensions
+                    embedding_cols = [col for col in embeddings_df.columns if col.startswith('embedding_')]
+                    print(f"\nEmbedding dimension: {len(embedding_cols)}")
+        
+        # Memory analysis
+        if torch.cuda.is_available():
+            print("\nGPU Memory Analysis:")
+            print(f"Peak Memory Allocated: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
+            print(f"Peak Memory Reserved: {torch.cuda.max_memory_reserved() / 1e9:.2f} GB")
+            print(f"Memory Allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+            print(f"Memory Reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
+            
+            # Reset peak stats
+            torch.cuda.reset_peak_memory_stats()
+        
+        print("\nTraining completed successfully!")
+        
     except Exception as e:
         import traceback
         print(f"Error in main: {str(e)}")
         traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()

@@ -892,11 +892,58 @@ class EnhancedHybridTransactionModel(nn.Module):
                 seq_features[i, j] = node_features[idx]
         
         # Create timestamps with enhanced stability and error handling
-        if 'timestamp' in df.columns or 'books_create_timestamp' in df.columns or 'update_timestamp' in df.columns:
-            # Try multiple timestamp columns with fallbacks
-            for ts_col in ['timestamp', 'books_create_timestamp', 'update_timestamp', 'generated_timestamp']:
+        # First, prioritize checking for generated_timestamp explicitly
+        if 'generated_timestamp' in df.columns:
+            try:
+                print("Found 'generated_timestamp' column - attempting to use it")
+                # Convert to pandas datetime with error handling
+                timestamps = pd.to_datetime(df['generated_timestamp'], errors='coerce')
+                
+                # Check if conversion worked
+                if timestamps.isna().all():
+                    raise ValueError("All timestamp values are NaN after conversion")
+                    
+                # Fill NaT values with median timestamp to avoid NaN propagation
+                median_ts = timestamps.median()
+                timestamps = timestamps.fillna(median_ts)
+                
+                # Convert to seconds since epoch (float)
+                timestamps_int = timestamps.astype('int64') // 10**9  # Integer division for stability
+                
+                # Normalize to avoid extreme values
+                min_ts = timestamps_int.min()
+                timestamps_norm = timestamps_int - min_ts  # Make relative to minimum
+                
+                # Create timestamps tensor directly with careful typecasting
+                if len(timestamps_norm) >= batch_size * seq_len:
+                    # Explicitly convert to numpy array of floats first
+                    ts_array = timestamps_norm.to_numpy().astype(np.float32)
+                    # Ensure no NaNs or strings
+                    ts_array = np.nan_to_num(ts_array, nan=0.0)
+                    # Create the tensor and reshape
+                    timestamps_tensor = torch.tensor(ts_array[:batch_size * seq_len], dtype=torch.float32)
+                    timestamps_tensor = timestamps_tensor.view(batch_size, seq_len)
+                    print("Successfully using 'generated_timestamp' column")
+                else:
+                    raise ValueError(f"Not enough timestamps ({len(timestamps_norm)}) for required shape ({batch_size}x{seq_len})")
+            except Exception as e:
+                print(f"Error processing generated_timestamp: {str(e)}")
+                print("Falling back to other timestamp columns...")
+                # Fall through to the default timestamp handling below
+                timestamps_tensor = None
+        else:
+            # No generated_timestamp found
+            timestamps_tensor = None
+            
+        # Try other timestamp columns if generated_timestamp processing failed
+        if timestamps_tensor is None:
+            timestamp_tried = False
+            # Check for any timestamp column
+            for ts_col in ['timestamp', 'books_create_timestamp', 'update_timestamp']:
                 if ts_col in df.columns:
+                    timestamp_tried = True
                     try:
+                        print(f"Trying timestamp column: {ts_col}")
                         # Convert to pandas datetime with error handling
                         timestamps = pd.to_datetime(df[ts_col], errors='coerce')
                         
@@ -904,35 +951,42 @@ class EnhancedHybridTransactionModel(nn.Module):
                         median_ts = timestamps.median()
                         timestamps = timestamps.fillna(median_ts)
                         
-                        # Convert to seconds since epoch (float)
-                        timestamps = timestamps.astype('int64') // 10**9  # Integer division for stability
+                        # Convert to seconds since epoch as float directly
+                        # Use to_numpy() for safer conversion
+                        ts_array = (timestamps.astype('int64') // 10**9).to_numpy().astype(np.float32)
                         
                         # Normalize to avoid extreme values
-                        min_ts = timestamps.min()
-                        timestamps = timestamps - min_ts  # Make relative to minimum
+                        min_ts = np.min(ts_array)
+                        ts_array = ts_array - min_ts  # Make relative to minimum
                         
                         # Check if we have enough timestamp values
-                        if len(timestamps) >= batch_size * seq_len:
-                            # We have enough timestamps, use them directly with safeguards
-                            timestamps_tensor = torch.tensor(timestamps[:batch_size * seq_len].values, 
-                                                          dtype=torch.float)
+                        if len(ts_array) >= batch_size * seq_len:
+                            # Create tensor with explicit dtype
+                            timestamps_tensor = torch.tensor(ts_array[:batch_size * seq_len], dtype=torch.float32)
                             timestamps_tensor = timestamps_tensor.view(batch_size, seq_len)
                             
                             # Apply final numerical safeguards
                             timestamps_tensor = torch.nan_to_num(timestamps_tensor, nan=0.0)
-                            print(f"Using {ts_col} for timestamps")
+                            print(f"Successfully using {ts_col} for timestamps")
                             break
+                        else:
+                            print(f"Not enough values in {ts_col} for required tensor shape")
                     except Exception as e:
-                        print(f"Error processing {ts_col}: {str(e)}. Trying next timestamp column.")
+                        print(f"Error processing {ts_col}: {str(e)}")
                         continue
-            else:
-                # No valid timestamp column found or processed
-                print("No valid timestamp column found. Using synthetic timestamps.")
-                timestamps_tensor = torch.arange(batch_size * seq_len, dtype=torch.float).view(batch_size, seq_len)
-        else:
-            # Create synthetic timestamps with proper shape
-            print("No timestamp column found. Using synthetic timestamps.")
-            timestamps_tensor = torch.arange(batch_size * seq_len, dtype=torch.float).view(batch_size, seq_len)
+            
+            # If all timestamp columns failed or none found, use synthetic timestamps
+            if timestamps_tensor is None:
+                if timestamp_tried:
+                    print("All timestamp columns failed processing. Using synthetic timestamps.")
+                else:
+                    print("No timestamp columns found. Using synthetic timestamps.")
+                # Create evenly spaced sequence
+                timestamps_tensor = torch.arange(batch_size * seq_len, dtype=torch.float32).view(batch_size, seq_len)
+        
+        # Final safety check - replace any remaining NaNs and extreme values
+        timestamps_tensor = torch.nan_to_num(timestamps_tensor, nan=0.0, posinf=1e5, neginf=0.0)
+        timestamps_tensor = torch.clamp(timestamps_tensor, min=0.0, max=1e5)
         
         # Final safety check - replace any remaining NaNs and extreme values
         timestamps_tensor = torch.nan_to_num(timestamps_tensor, nan=0.0, posinf=1e5, neginf=0.0)

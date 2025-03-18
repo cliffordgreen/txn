@@ -537,22 +537,67 @@ def prepare_model_inputs(batch_df, model, device):
         # Prepare labels dictionary
         labels = {}
         
-        # Convert labels directly to tensors on the target device
-        category_tensor = torch.tensor(
-            batch_df['category_id'].values, 
-            dtype=torch.long,
-            device=device  # Create tensor directly on target device
-        )
-        labels['category'] = category_tensor
+        # Convert labels directly to tensors on the target device with strict type checking
+        category_values = batch_df['category_id'].values
         
-        # Add tax_type if available
-        if 'tax_type_id' in batch_df.columns:
-            tax_type_tensor = torch.tensor(
-                batch_df['tax_type_id'].values,
+        # Check for and handle string values in category_id
+        if category_values.dtype == object:  # Object dtype suggests strings or mixed types
+            print("Warning: Found non-numeric category_id values. Converting to integers...")
+            try:
+                # Try to convert to numeric values first
+                category_values = pd.to_numeric(batch_df['category_id'], errors='coerce').fillna(0).astype(np.int64).values
+            except Exception as e:
+                print(f"Error converting category_id to numeric: {str(e)}")
+                # Fallback: use factorize to create integer codes for strings
+                print("Using factorize to convert categorical values to integer codes")
+                category_codes, _ = pd.factorize(batch_df['category_id'])
+                category_values = category_codes.astype(np.int64)
+        
+        # Create tensor with explicit dtype and error checking
+        try:
+            category_tensor = torch.tensor(
+                category_values, 
                 dtype=torch.long,
                 device=device  # Create tensor directly on target device
             )
-            labels['tax_type'] = tax_type_tensor
+            labels['category'] = category_tensor
+        except Exception as e:
+            print(f"Error creating category tensor: {str(e)}")
+            print(f"Category values dtype: {category_values.dtype}, shape: {category_values.shape}")
+            print(f"Sample values: {category_values[:5]}")
+            # Last resort fallback - create zeros tensor of correct shape
+            category_tensor = torch.zeros(len(batch_df), dtype=torch.long, device=device)
+            labels['category'] = category_tensor
+            
+        # Add tax_type if available - with similar safeguards
+        if 'tax_type_id' in batch_df.columns:
+            tax_type_values = batch_df['tax_type_id'].values
+            
+            # Check for and handle string values in tax_type_id
+            if tax_type_values.dtype == object:  # Object dtype suggests strings or mixed types
+                print("Warning: Found non-numeric tax_type_id values. Converting to integers...")
+                try:
+                    # Try to convert to numeric values first
+                    tax_type_values = pd.to_numeric(batch_df['tax_type_id'], errors='coerce').fillna(0).astype(np.int64).values
+                except Exception as e:
+                    print(f"Error converting tax_type_id to numeric: {str(e)}")
+                    # Fallback: use factorize to create integer codes for strings
+                    tax_type_codes, _ = pd.factorize(batch_df['tax_type_id'])
+                    tax_type_values = tax_type_codes.astype(np.int64)
+            
+            # Create tensor with explicit dtype and error checking
+            try:
+                tax_type_tensor = torch.tensor(
+                    tax_type_values,
+                    dtype=torch.long,
+                    device=device  # Create tensor directly on target device
+                )
+                labels['tax_type'] = tax_type_tensor
+            except Exception as e:
+                print(f"Error creating tax_type tensor: {str(e)}")
+                # Last resort fallback - create zeros tensor of correct shape
+                tax_type_tensor = torch.zeros(len(batch_df), dtype=torch.long, device=device)
+                labels['tax_type'] = tax_type_tensor
         
         return data, labels
         

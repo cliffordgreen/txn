@@ -356,8 +356,10 @@ class ParquetTransactionDataset(Dataset):
             # Read only these columns and only the first few rows
             try:
                 # Safest: most constrained reading approach
-                table = pq.read_table(file_path, columns=target_cols, num_rows=sample_size)
-                sample_df = table.to_pandas()
+                # PyArrow read_table doesn't accept num_rows, use read_pandas instead
+                table = pq.read_table(file_path, columns=target_cols)
+                # Then slice to limit rows
+                sample_df = table.slice(0, sample_size).to_pandas()
                 print(f"Successfully read {len(sample_df)} rows with {len(target_cols)} columns")
                 
                 # Apply preprocessing if needed - but with caution
@@ -381,10 +383,13 @@ class ParquetTransactionDataset(Dataset):
         try:
             # Hardcode minimal column selection
             try:
-                sample_df = pd.read_parquet(file_path, engine='pyarrow', columns=['category_id'], nrows=10)
+                # pandas read_parquet doesn't use nrows, we'll load all and slice
+                sample_df = pd.read_parquet(file_path, engine='pyarrow', columns=['category_id'])
+                sample_df = sample_df.head(10)  # Limit to 10 rows
             except:
                 # If that fails, try without column selection
-                sample_df = pd.read_parquet(file_path, engine='pyarrow', nrows=5)
+                sample_df = pd.read_parquet(file_path, engine='pyarrow')
+                sample_df = sample_df.head(5)  # Limit to 5 rows
                 
             print(f"Fallback read {len(sample_df)} rows with pandas")
             return sample_df

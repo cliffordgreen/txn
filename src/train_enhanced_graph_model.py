@@ -2140,8 +2140,8 @@ def main():
                     print(f"File has {len(parquet_schema.names)} columns")
                     
                     # Read just a few rows first to be cautious
-                    table = pq.read_table(sample_file, columns=['category_id', 'tax_type_id'] if 'category_id' in parquet_schema.names else None, rows=10)
-                    small_sample_df = table.to_pandas()
+                    table = pq.read_table(sample_file, columns=['category_id', 'tax_type_id'] if 'category_id' in parquet_schema.names else None)
+                    small_sample_df = table.slice(0, 10).to_pandas()  # Take first 10 rows
                     print(f"Successfully read {len(small_sample_df)} rows for schema analysis")
                     
                     # Show how many categories we have from the small sample
@@ -2154,8 +2154,8 @@ def main():
                             print("Small sample has few categories, trying to read more rows...")
                             try:
                                 # Try to read up to 100 rows
-                                table = pq.read_table(sample_file, columns=['category_id', 'tax_type_id'], rows=100)
-                                sample_df = table.to_pandas()
+                                table = pq.read_table(sample_file, columns=['category_id', 'tax_type_id'])
+                                sample_df = table.slice(0, 100).to_pandas()  # Take first 100 rows
                                 num_categories = sample_df['category_id'].nunique() if 'category_id' in sample_df.columns else 400
                                 num_tax_types = sample_df['tax_type_id'].nunique() if 'tax_type_id' in sample_df.columns else 20
                             except Exception as e:
@@ -2175,7 +2175,8 @@ def main():
                     
                     try:
                         # Fallback to pandas with strict constraints
-                        sample_df = pd.read_parquet(sample_file, engine='pyarrow', columns=['category_id', 'tax_type_id'], nrows=50)
+                        sample_df = pd.read_parquet(sample_file, engine='pyarrow', columns=['category_id', 'tax_type_id'])
+                        sample_df = sample_df.head(50)  # Limit to 50 rows
                         
                         # Get counts
                         num_categories = sample_df['category_id'].nunique() if 'category_id' in sample_df.columns else 400

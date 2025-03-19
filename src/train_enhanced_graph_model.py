@@ -2116,7 +2116,7 @@ def main():
         
         # Default values in case sampling fails
         num_categories = 400
-        num_tax_types = 20
+        num_tax_account_types = 20
         
         try:
             print("Getting sample batch of 100 rows with low memory approach...")
@@ -2140,7 +2140,7 @@ def main():
                     print(f"File has {len(parquet_schema.names)} columns")
                     
                     # Read just a few rows first to be cautious
-                    table = pq.read_table(sample_file, columns=['category_id', 'tax_type_id'] if 'category_id' in parquet_schema.names else None)
+                    table = pq.read_table(sample_file, columns=['category_id', 'tax_account_type'] if 'category_id' in parquet_schema.names else None)
                     small_sample_df = table.slice(0, 10).to_pandas()  # Take first 10 rows
                     print(f"Successfully read {len(small_sample_df)} rows for schema analysis")
                     
@@ -2154,16 +2154,16 @@ def main():
                             print("Small sample has few categories, trying to read more rows...")
                             try:
                                 # Try to read up to 100 rows
-                                table = pq.read_table(sample_file, columns=['category_id', 'tax_type_id'])
+                                table = pq.read_table(sample_file, columns=['category_id', 'tax_account_type'])
                                 sample_df = table.slice(0, 100).to_pandas()  # Take first 100 rows
                                 num_categories = sample_df['category_id'].nunique() if 'category_id' in sample_df.columns else 400
-                                num_tax_types = sample_df['tax_type_id'].nunique() if 'tax_type_id' in sample_df.columns else 20
+                                num_tax_account_types = sample_df['tax_account_type'].nunique() if 'tax_account_type' in sample_df.columns else 20
                             except Exception as e:
                                 print(f"Error reading larger sample: {str(e)}")
                         else:
                             # Use values from small sample
                             num_categories = num_small_categories if 'category_id' in small_sample_df.columns else 400
-                            num_tax_types = small_sample_df['tax_type_id'].nunique() if 'tax_type_id' in small_sample_df.columns else 20
+                            num_tax_account_types = small_sample_df['tax_account_type'].nunique() if 'tax_account_type' in small_sample_df.columns else 20
                     
                     print("Partial schema analysis (based on limited columns):")
                     for col in small_sample_df.columns:
@@ -2175,12 +2175,12 @@ def main():
                     
                     try:
                         # Fallback to pandas with strict constraints
-                        sample_df = pd.read_parquet(sample_file, engine='pyarrow', columns=['category_id', 'tax_type_id'])
+                        sample_df = pd.read_parquet(sample_file, engine='pyarrow', columns=['category_id', 'tax_account_type'])
                         sample_df = sample_df.head(50)  # Limit to 50 rows
                         
                         # Get counts
                         num_categories = sample_df['category_id'].nunique() if 'category_id' in sample_df.columns else 400
-                        num_tax_types = sample_df['tax_type_id'].nunique() if 'tax_type_id' in sample_df.columns else 20
+                        num_tax_account_types = sample_df['tax_account_type'].nunique() if 'tax_account_type' in sample_df.columns else 20
                     except Exception as e2:
                         print(f"Error with pandas approach: {str(e2)}")
                         print("Using default values")
@@ -2188,13 +2188,13 @@ def main():
                 print("No training files available for schema analysis")
             
             print(f"\n✓ Number of unique categories: {num_categories}")
-            print(f"✓ Number of unique tax types: {num_tax_types}")
+            print(f"✓ Number of unique tax account types: {num_tax_account_types}")
                 
         except Exception as e:
             print(f"⚠️ Error analyzing sample data: {str(e)}")
-            print("Using default category and tax type counts")
+            print("Using default category and tax account type counts")
             num_categories = 400
-            num_tax_types = 20
+            num_tax_account_types = 20
         
         # Model initialization phase
         print("\n🧠 Model Initialization Phase")
@@ -2205,7 +2205,7 @@ def main():
         gc.collect()
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
-        model = initialize_model(config.hidden_dim, num_categories, num_tax_types, config, device)
+        model = initialize_model(config.hidden_dim, num_categories, num_tax_account_types, config, device)
         log_memory_usage("after model initialization")
         
         # Count parameters - handle LazyLinear layers

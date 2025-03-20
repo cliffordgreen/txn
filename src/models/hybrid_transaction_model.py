@@ -602,7 +602,7 @@ class EnhancedHybridTransactionModel(nn.Module):
         # Ensure input dimensions match the model's expectations
         # The error 'mat1 and mat2 shapes cannot be multiplied (128x128 and 512x512)' indicates 
         # a dimension mismatch in the input projection layer
-        expected_input_dim = 512  # From the error message, seems the model expects 512 dim
+        expected_input_dim = self.hidden_dim  # Use the model's configured hidden_dim
         
         # Dynamically adjust x if needed to match expected dimension
         if x.shape[1] != expected_input_dim:

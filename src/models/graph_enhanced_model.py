@@ -233,16 +233,17 @@ class GraphEnhancedTemporalModel(nn.Module):
         )
         
         # Feature fusion - combine graph and temporal features
+        # Use dynamic dimensions to handle both 128 and 512 hidden dimensions
         self.feature_fusion = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LazyLinear(hidden_dim),  # LazyLinear adapts to input dimension at runtime
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout)
         )
         
-        # Output layers
+        # Output layers - use dynamic dimensions to handle both 128 and 512 hidden dimensions
         self.output_layer = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.LazyLinear(hidden_dim * 2),  # LazyLinear adapts to input dimension at runtime
             nn.LayerNorm(hidden_dim * 2),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -252,7 +253,7 @@ class GraphEnhancedTemporalModel(nn.Module):
         # Secondary output for tax account type prediction (if multi-task)
         if self.multi_task:
             self.tax_output_layer = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim * 2),
+                nn.LazyLinear(hidden_dim * 2),  # LazyLinear adapts to input dimension at runtime
                 nn.LayerNorm(hidden_dim * 2),
                 nn.GELU(),
                 nn.Dropout(dropout),
@@ -363,8 +364,37 @@ class GraphEnhancedTemporalModel(nn.Module):
         else:
             graph_h_pooled = graph_h
             
+        # Ensure dimensions match before combining
+        # Use projection if dimensions don't match
+        if not hasattr(self, 'graph_projection') and graph_h_pooled.size(1) != self.hidden_dim:
+            self.graph_projection = nn.Linear(
+                graph_h_pooled.size(1), self.hidden_dim
+            ).to(graph_h_pooled.device)
+            print(f"Created graph_projection layer: {graph_h_pooled.size(1)} → {self.hidden_dim}")
+            
+        if not hasattr(self, 'temporal_projection') and temporal_h.size(1) != self.hidden_dim:
+            self.temporal_projection = nn.Linear(
+                temporal_h.size(1), self.hidden_dim
+            ).to(temporal_h.device)
+            print(f"Created temporal_projection layer: {temporal_h.size(1)} → {self.hidden_dim}")
+            
+        # Apply projections if needed
+        if hasattr(self, 'graph_projection'):
+            graph_h_pooled = self.graph_projection(graph_h_pooled)
+            
+        if hasattr(self, 'temporal_projection'):
+            temporal_h = self.temporal_projection(temporal_h)
+        
+        # Print dimensions for debugging
+        print(f"Dimensions before fusion - graph_h_pooled: {graph_h_pooled.shape}, temporal_h: {temporal_h.shape}")
+        
         # Combine features
         combined_h = torch.cat([graph_h_pooled, temporal_h], dim=1)
+        
+        # Print combined dimensions
+        print(f"Combined dimensions: {combined_h.shape}")
+        
+        # Apply feature fusion
         fused_h = self.feature_fusion(combined_h)
         
         # Output projection

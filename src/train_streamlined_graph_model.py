@@ -379,7 +379,7 @@ def prepare_model_inputs(batch_df, model, device):
     return data, labels
 
 
-def create_cuda_graph(model, sample_data):
+def create_cuda_graph(model, sample_data, config):
     """Create CUDA graph for model inference"""
     if not torch.cuda.is_available() or not config.use_cuda_graphs:
         return None
@@ -481,7 +481,7 @@ def initialize_model(hidden_dim, num_categories, num_tax_types, config, device):
     return model
 
 
-def evaluate(model, dataloader, dataset, device, cuda_graph=None):
+def evaluate(model, dataloader, dataset, device, config, cuda_graph=None):
     """Evaluate the model on the given dataset"""
     model.eval()
     
@@ -983,11 +983,11 @@ def train(model, train_dataset, val_dataset, config, device):
                 
                 # Initialize CUDA graph for inference if enabled
                 if config.use_cuda_graphs and cuda_graph is None and torch.cuda.is_available():
-                    cuda_graph = create_cuda_graph(model, data)
+                    cuda_graph = create_cuda_graph(model, data, config)
                 
                 # Run evaluation
                 model.eval()
-                val_loss, val_acc = evaluate(model, val_loader, val_dataset, device, cuda_graph)
+                val_loss, val_acc = evaluate(model, val_loader, val_dataset, device, config, cuda_graph)
                 model.train()
                 
                 # Print validation results
@@ -1001,7 +1001,7 @@ def train(model, train_dataset, val_dataset, config, device):
         
         # Full validation at end of epoch
         model.eval()
-        val_loss, val_acc = evaluate(model, val_loader, val_dataset, device, cuda_graph)
+        val_loss, val_acc = evaluate(model, val_loader, val_dataset, device, config, cuda_graph)
         
         # Update learning rate
         current_lr = optimizer.param_groups[0]['lr']

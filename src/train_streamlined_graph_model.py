@@ -379,10 +379,10 @@ def prepare_model_inputs(batch_df, model, device):
     return data, labels
 
 
-def create_cuda_graph(model, sample_data, config):
+def create_cuda_graph(model, sample_data, config, device):
     """Create CUDA graph for model inference"""
-    if not torch.cuda.is_available() or not config.use_cuda_graphs:
-        return None
+    # if not torch.cuda.is_available() or not config.use_cuda_graphs:
+    #     return None
     
     print("Creating CUDA graph for optimized inference...")
     
@@ -411,7 +411,7 @@ def create_cuda_graph(model, sample_data, config):
             static_inputs[k].copy_(v)
         else:
             static_inputs[k] = v
-    
+
     # Set model to eval mode for graph capture
     model.eval()
     
@@ -592,7 +592,6 @@ def train(model, train_dataset, val_dataset, config, device):
     print(f"\n{'='*80}\nStarting Training\n{'='*80}")
     print(f"Batch size: {config.batch_size}")
     print(f"Hidden dimension: {config.hidden_dim}")
-    
     # Create optimizer with improved numerical stability settings
     optimizer = optim.AdamW(
         model.parameters(),
@@ -655,7 +654,7 @@ def train(model, train_dataset, val_dataset, config, device):
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=8,
         pin_memory=torch.cuda.is_available(),
         collate_fn=df_collate_fn
     )
@@ -665,7 +664,7 @@ def train(model, train_dataset, val_dataset, config, device):
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=8,
         pin_memory=torch.cuda.is_available(),
         collate_fn=df_collate_fn
     )
@@ -980,13 +979,14 @@ def train(model, train_dataset, val_dataset, config, device):
             # Periodic validation during training
             if step > 0 and step % config.eval_steps == 0:
                 print(f"\nPerforming validation at step {step}/{len(train_loader)}")
-                
+                model.eval()
                 # Initialize CUDA graph for inference if enabled
                 if config.use_cuda_graphs and cuda_graph is None and torch.cuda.is_available():
-                    cuda_graph = create_cuda_graph(model, data, config)
-                
+                #config.cuda_graph_batch_size = len(batch_df)
+                    cuda_graph = create_cuda_graph(model, data, config, device)
+                    
                 # Run evaluation
-                model.eval()
+                #model.eval()
                 val_loss, val_acc = evaluate(model, val_loader, val_dataset, device, config, cuda_graph)
                 model.train()
                 

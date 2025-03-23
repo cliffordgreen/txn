@@ -28,6 +28,45 @@ try:
 except ImportError:
     HAS_GRAPH_PROCESSING = False
 
+# --- FIXED FEATURE SCHEMA (Define at the top level) ---
+# This is *crucial*. It defines the *exact* features the model expects.
+FEATURE_SCHEMA = {
+    'numerical': [
+        'amount', 'log_amount', 'user_id', 'merchant_id', 'company_id',
+        'industry_code', 'region_id', 'language_id', 'account_type_id',
+        'tax_account_type', 'scheduleC_id'
+    ],
+    'boolean': [
+        'is_new_user', 'is_before_cutoff_date',
+        'qbo_accountant_attached_current_flag', 'qbo_accountant_attached_ever',
+        'qblive_attach_flag', 'is_test_data', 'is_validated'
+    ],
+    'categorical': [
+        'transaction_type', 'qbo_current_product', 'qbo_signup_type_desc',
+        'company_model_bucket_name', 'industry_name', 'tax_type', 'merchant_category'
+    ],
+    'timestamp': [  # Prioritize these
+        'generated_timestamp', 'timestamp', 'books_create_timestamp', 'update_timestamp', 'transaction_date'
+    ]
+}
+
+# Define fixed categories for each categorical feature
+# If a category is not in this list, it will be mapped to 'UNKNOWN'
+FIXED_CATEGORIES = {
+    'transaction_type': ['DEBIT', 'CREDIT', 'CHECK', 'TRANSFER', 'UNKNOWN'],
+    'qbo_current_product': ['QBSE', 'QBO', 'QBOA', 'OTHER', 'UNKNOWN'],
+    'industry_name': ['RETAIL', 'PROFESSIONAL_SERVICES', 'CONSTRUCTION', 'MANUFACTURING', 'FINANCE', 'HEALTHCARE', 'UNKNOWN'],
+    'company_type': ['LLC', 'CORPORATION', 'SOLE_PROPRIETORSHIP', 'PARTNERSHIP', 'UNKNOWN'],
+    'company_size': ['SMALL', 'MEDIUM', 'LARGE', 'UNKNOWN'],
+    'qbo_signup_type_desc': ['DIRECT', 'PARTNER', 'TRIAL', 'CONVERSION', 'UNKNOWN'],
+    'company_model_bucket_name': ['BUCKET_1', 'BUCKET_2', 'BUCKET_3', 'BUCKET_4', 'UNKNOWN'],
+    'tax_type': ['BUSINESS', 'PERSONAL', 'MIXED', 'UNKNOWN'],
+    'merchant_category': ['RETAIL', 'SERVICES', 'UTILITIES', 'TRAVEL', 'FOOD', 'UNKNOWN']
+}
+
+MAX_SEQ_LEN = 5  # Fixed sequence length
+INPUT_FEATURE_DIM = 128  # Base feature dimension
+
 class HybridTransactionModel(torch.nn.Module):
     """
     Hybrid Transaction Classification Model that combines:
@@ -600,13 +639,11 @@ class EnhancedHybridTransactionModel(nn.Module):
         print(f"seq_features shape: {seq_features.shape}, timestamps shape: {timestamps.shape}")
         
         # Ensure input dimensions match the model's expectations
-        # The error 'mat1 and mat2 shapes cannot be multiplied (128x128 and 512x512)' indicates 
-        # a dimension mismatch in the input projection layer
         expected_input_dim = self.hidden_dim  # Use the model's configured hidden_dim
         
         # Dynamically adjust x if needed to match expected dimension
         if x.shape[1] != expected_input_dim:
-            print(f"Reshaping x from {x.shape} to match expected input dimension")
+            print(f"Reshaping x from {x.shape} to match expected input dimension {expected_input_dim}")
             # If x has too few dimensions, pad it
             if x.shape[1] < expected_input_dim:
                 padding = torch.zeros(x.shape[0], expected_input_dim - x.shape[1], device=x.device)
@@ -616,6 +653,24 @@ class EnhancedHybridTransactionModel(nn.Module):
                 x = x[:, :expected_input_dim]
             print(f"New x shape: {x.shape}")
         
+        # Handle company features dimension alignment
+        if company_features is not None:
+            # Print shape information for debugging
+            print(f"Company features shape: {company_features.shape}, company_input_dim: {self.hidden_dim}")
+            
+            # Check if dimensions need to be aligned
+            if company_features.shape[1] != self.hidden_dim:
+                # Create alignment layer if needed
+                if not hasattr(self, 'company_align') or self.company_align.in_features != company_features.shape[1]:
+                    print(f"INFO: Aligning company feature dimension from {company_features.shape[1]} to {self.hidden_dim}")
+                    self.company_align = nn.Linear(
+                        company_features.shape[1],
+                        self.hidden_dim
+                    ).to(company_features.device)
+                
+                # Apply alignment
+                company_features = self.company_align(company_features)
+        
         # Forward pass through graph model
         graph_output = self.graph_model(
             x=x,
@@ -624,7 +679,7 @@ class EnhancedHybridTransactionModel(nn.Module):
             edge_attr=edge_attr,
             seq_features=seq_features,
             timestamps=timestamps,
-            company_features=company_features,
+            company_features=company_features,  # Aligned company features
             company_ids=company_ids,
             batch_size=batch_size,
             seq_len=seq_len,
@@ -636,7 +691,7 @@ class EnhancedHybridTransactionModel(nn.Module):
         graph_input_dim = self.temporal_model.graph_input_dim
         
         # Add projection if the dimensions don't match
-        if not hasattr(self, 'tabular_projection'):
+        if not hasattr(self, 'tabular_projection') or self.tabular_projection.in_features != tabular_features.size(-1):
             self.tabular_projection = nn.Linear(
                 tabular_features.size(-1), 
                 graph_input_dim
@@ -656,7 +711,7 @@ class EnhancedHybridTransactionModel(nn.Module):
             descriptions=descriptions,
             user_features=user_features,
             is_new_user=is_new_user,
-            company_features=company_features,
+            company_features=company_features,  # Use the aligned company features
             company_ids=company_ids
         )
         
@@ -706,681 +761,742 @@ class EnhancedHybridTransactionModel(nn.Module):
             
             return category_logits
     
-    def prepare_data_from_dataframe(self, df):
+    # --- Modified Graph Building Function (Handles Missing Data) ---
+    
+    def build_transaction_relationship_graph(self, df):
+        """Builds a transaction relationship graph, handling missing IDs."""
+        try:
+            # Prioritize company_id, then user_id, then merchant_id for edges.
+            if 'company_id' in df.columns and df['company_id'].notna().any():
+                ids = df['company_id'].dropna().unique()
+                # Create edges based on shared company_id
+                edges = []
+                for id_ in ids:
+                    indices = df[df['company_id'] == id_].index.tolist()
+                    for i in range(len(indices)):
+                        for j in range(i + 1, len(indices)):
+                            edges.append((indices[i], indices[j]))
+                            edges.append((indices[j], indices[i]))  # Bidirectional
+    
+            elif 'user_id' in df.columns and df['user_id'].notna().any():
+                ids = df['user_id'].dropna().unique()
+                edges = []
+                for id_ in ids:
+                    indices = df[df['user_id'] == id_].index.tolist()
+                    for i in range(len(indices)):
+                        for j in range(i + 1, len(indices)):
+                            edges.append((indices[i], indices[j]))
+                            edges.append((indices[j], indices[i]))
+    
+            elif 'merchant_id' in df.columns and df['merchant_id'].notna().any():
+                ids = df['merchant_id'].dropna().unique()
+                edges = []
+                for id_ in ids:
+                    indices = df[df['merchant_id'] == id_].index.tolist()
+                    for i in range(len(indices)):
+                        for j in range(i+1, len(indices)):
+                            edges.append((indices[i], indices[j]))
+                            edges.append((indices[j], indices[i]))
+    
+            else:
+                # No suitable ID columns found. Return empty graph.
+                print("Warning: No suitable ID columns for graph construction. Returning an empty graph.")
+                return torch.empty((2, 0), dtype=torch.long), torch.empty((0, 1)), torch.empty(0, dtype=torch.long)
+    
+            if not edges: #no edges made
+                return torch.empty((2, 0), dtype=torch.long), torch.empty((0, 1)), torch.empty(0, dtype=torch.long)
+    
+            edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+    
+            # Basic edge attributes
+            edge_attr = torch.ones(edge_index.shape[1], 1)  # Single feature: edge existence
+            edge_type = torch.zeros(edge_index.shape[1], dtype=torch.long)  # Single edge type
+    
+            return edge_index, edge_attr, edge_type
+    
+        except Exception as e:
+            print(f"Error building graph: {e}. Returning an empty graph.")
+            return torch.empty((2, 0), dtype=torch.long), torch.empty((0, 1)), torch.empty(0, dtype=torch.long)
+    
+    def prepare_data_from_dataframe(self, df, batch_size=128, seq_len=5):
         """
-        Prepare data for the model from a DataFrame.
+        Prepare data for the model from a DataFrame using the FIXED feature schema.
         
         Args:
             df: DataFrame containing transaction data
+            batch_size: Size of batch for training (default: 128)
+            seq_len: Length of sequences for temporal data (default: 5)
             
         Returns:
-            Dictionary with prepared data
+            Dictionary with prepared data ready for model input
         """
         if not HAS_GRAPH_PROCESSING:
-            raise ImportError("build_transaction_relationship_graph is required but not available")
-            
-        # Build transaction relationship graph based on merchants, companies, etc.
-        edge_index, edge_attr, edge_type = build_transaction_relationship_graph(df)
-        
-        # Extract features from the transaction data
-        # This is a comprehensive feature extraction based on transaction_data_batch schema
-        features = []
-        
-        # ---- Numerical Features ----
-        
-        # Amount features
-        if 'amount' in df.columns:
-            amount = df['amount'].values
-            amount_normalized = (amount - np.mean(amount)) / (np.std(amount) + 1e-8)
-            features.append(amount_normalized)
-            
-            # Log amount (for skewed distributions)
-            log_amount = np.log1p(np.abs(amount)) * np.sign(amount)  # log(1+abs(x)) * sign(x)
-            features.append(log_amount)
-            
-        # User features
-        if 'user_id' in df.columns:
-            user_ids = pd.factorize(df['user_id'])[0]
-            user_ids_norm = user_ids / max(1, user_ids.max())
-            features.append(user_ids_norm)
-            
-        # Merchant features
-        if 'merchant_id' in df.columns:
-            merchant_ids = pd.factorize(df['merchant_id'])[0]
-            merchant_ids_norm = merchant_ids / max(1, merchant_ids.max())
-            features.append(merchant_ids_norm)
-            
-        # Company features
-        if 'company_id' in df.columns:
-            company_ids = pd.factorize(df['company_id'])[0]
-            company_ids_norm = company_ids / max(1, company_ids.max())
-            features.append(company_ids_norm)
-            
-            # Extract actual company IDs for temporal grouping
-            company_ids_tensor = torch.tensor(company_ids, dtype=torch.long)
+            # Use our built-in graph builder instead
+            print(f"Building transaction relationship graph from {len(df)} records")
+            edge_index, edge_attr, edge_type = self.build_transaction_relationship_graph(df)
         else:
-            company_ids_tensor = None
-            
-        # Industry code
-        if 'industry_code' in df.columns:
-            industry_codes = df['industry_code'].values.astype(float)
-            industry_codes_norm = industry_codes / max(1, np.max(industry_codes))
-            features.append(industry_codes_norm)
-            
-        # Region ID
-        if 'region_id' in df.columns:
-            region_ids = df['region_id'].values.astype(float)
-            region_ids_norm = region_ids / max(1, np.max(region_ids))
-            features.append(region_ids_norm)
-            
-        # Language ID
-        if 'language_id' in df.columns:
-            language_ids = df['language_id'].values.astype(float)
-            language_ids_norm = language_ids / max(1, np.max(language_ids))
-            features.append(language_ids_norm)
-            
-        # Account type ID
-        if 'account_type_id' in df.columns:
-            account_type_ids = df['account_type_id'].values.astype(float)
-            account_type_ids_norm = account_type_ids / max(1, np.max(account_type_ids))
-            features.append(account_type_ids_norm)
-            
-        # Schedule C ID (tax schedule)
-        if 'scheduleC_id' in df.columns:
-            scheduleC_ids = df['scheduleC_id'].values.astype(float)
-            scheduleC_ids_norm = scheduleC_ids / max(1, np.max(scheduleC_ids))
-            features.append(scheduleC_ids_norm)
-            
-        # ---- Boolean Features ----
-            
-        # Is new user flag
-        if 'is_new_user' in df.columns:
-            is_new_user = df['is_new_user'].values.astype(float)
-            features.append(is_new_user)
-            
-        # Is before cutoff date
-        if 'is_before_cutoff_date' in df.columns:
-            is_before_cutoff = df['is_before_cutoff_date'].values.astype(float)
-            features.append(is_before_cutoff)
-            
-        # QBO accountant attached flag
-        if 'qbo_accountant_attached_current_flag' in df.columns:
-            qbo_accountant_flag = df['qbo_accountant_attached_current_flag'].values.astype(float)
-            features.append(qbo_accountant_flag)
-            
-        # QBO accountant ever attached
-        if 'qbo_accountant_attached_ever' in df.columns:
-            qbo_accountant_ever = df['qbo_accountant_attached_ever'].values.astype(float)
-            features.append(qbo_accountant_ever)
-            
-        # QBLive attach flag
-        if 'qblive_attach_flag' in df.columns:
-            qblive_flag = df['qblive_attach_flag'].values.astype(float)
-            features.append(qblive_flag)
-            
-        # ---- Categorical Features (One-Hot Encoded) ----
-            
-        # Transaction type
-        if 'transaction_type' in df.columns:
-            transaction_type_dummies = pd.get_dummies(df['transaction_type'])
-            for col in transaction_type_dummies.columns:
-                features.append(transaction_type_dummies[col].values)
+            print(f"Building transaction relationship graph using imported function")
+            edge_index, edge_attr, edge_type = build_transaction_relationship_graph(df)
+        
+        # --- 2. Feature Extraction (FIXED SCHEMA - This is the Core) ---
+        features = []
+    
+        # --- 2.a Numerical Features ---
+        for col in FEATURE_SCHEMA['numerical']:
+            if col == 'log_amount':
+                # Handle 'log_amount' (depends on 'amount')
+                if 'amount' in df.columns:
+                    amount = df['amount'].fillna(0).values  # Fill missing with 0
+                    log_amount = np.log1p(np.abs(amount)) * np.sign(amount)
+                    features.append(log_amount)
+                else:
+                    features.append(np.zeros(len(df)))  # Fill with 0 if 'amount' is missing
+            elif col in df.columns:
+                # Handle the column appropriately based on its name and content
+                if col in ['merchant_id', 'user_id']:
+                    # For IDs that might be strings, use factorization
+                    factorized_values, _ = pd.factorize(df[col])
+                    normalized = factorized_values / max(1, factorized_values.max())
+                    features.append(normalized)
+                else:
+                    # For true numeric columns
+                    try:
+                        values = df[col].fillna(0).values.astype(float)  # Fill missing with 0
+                        if values.std() > 0:
+                            values = (values - values.mean()) / values.std()
+                        features.append(values)
+                    except (ValueError, TypeError):
+                        # Fallback to factorization for non-numeric columns
+                        factorized_values, _ = pd.factorize(df[col])
+                        normalized = factorized_values / max(1, factorized_values.max())
+                        features.append(normalized)
+            else:
+                features.append(np.zeros(len(df)))  # Fill with 0 if missing
+    
+        # --- 2.b Boolean Features ---
+        for col in FEATURE_SCHEMA['boolean']:
+            if col in df.columns:
+                # Convert to float (0.0 and 1.0)
+                features.append(df[col].fillna(False).astype(float).values)
+            else:
+                features.append(np.zeros(len(df)))  # Fill missing with 0.0 (False)
+    
+        # --- 2.c Extract company_ids first for proper temporal grouping ---
+        company_ids_tensor = None  # Initialize for later use
+        if 'company_id' in df.columns:
+            # Extract company_ids properly for temporal grouping
+            factorized_values, _ = pd.factorize(df['company_id'])
+            company_ids_tensor = torch.tensor(factorized_values, dtype=torch.long)
+            print(f"Extracted company_ids_tensor with shape: {company_ids_tensor.shape}, {len(torch.unique(company_ids_tensor))} unique companies")
+        
+        # --- 2.d Categorical Features (One-Hot with FIXED CATEGORIES) ---
+        for col in FEATURE_SCHEMA['categorical']:
+            if col in df.columns:
+                # Skip company_id as we already processed it
+                if col == 'company_id':
+                    continue
                 
-        # QBO current product
-        if 'qbo_current_product' in df.columns:
-            qbo_product_dummies = pd.get_dummies(df['qbo_current_product'])
-            for col in qbo_product_dummies.columns:
-                features.append(qbo_product_dummies[col].values)
-                
-        # QBO signup type
-        if 'qbo_signup_type_desc' in df.columns:
-            qbo_signup_dummies = pd.get_dummies(df['qbo_signup_type_desc'])
-            for col in qbo_signup_dummies.columns:
-                features.append(qbo_signup_dummies[col].values)
-                
-        # Company model bucket
-        if 'company_model_bucket_name' in df.columns:
-            company_bucket_dummies = pd.get_dummies(df['company_model_bucket_name'])
-            for col in company_bucket_dummies.columns:
-                features.append(company_bucket_dummies[col].values)
-                
-        # Industry name
-        if 'industry_name' in df.columns:
-            industry_dummies = pd.get_dummies(df['industry_name'])
-            for col in industry_dummies.columns:
-                features.append(industry_dummies[col].values)
-                
-        # ---- Timestamp Features ----
-            
-        # Extract month and day of week from timestamps
-        for ts_col in ['books_create_timestamp', 'generated_timestamp', 'update_timestamp']:
-            if ts_col in df.columns:
-                try:
-                    # Ensure it's a datetime
-                    timestamps = pd.to_datetime(df[ts_col])
+                # Use pd.Categorical with pre-defined categories
+                if col in FIXED_CATEGORIES:
+                    # Add a dummy category for values not in our predefined list
+                    cat_values = df[col].fillna('UNKNOWN').astype(str).str.upper()
+                    cat_values = cat_values.apply(lambda x: x if x in FIXED_CATEGORIES[col] else 'UNKNOWN')
                     
-                    # Month as cyclical feature (sin, cos encoding preserves cyclical nature)
+                    # Create categorical with fixed categories
+                    cat_series = pd.Categorical(cat_values, categories=FIXED_CATEGORIES[col])
+                    dummies = pd.get_dummies(cat_series, prefix=col)
+                    
+                    # Append all one-hot encoded columns (in the correct order)
+                    for cat in FIXED_CATEGORIES[col]:
+                        col_name = f"{col}_{cat}"
+                        if col_name in dummies.columns:
+                            features.append(dummies[col_name].values)
+                        else:
+                            # Category not present in this batch
+                            features.append(np.zeros(len(df)))
+                else:
+                    # Fallback for any categorical features not in our fixed schema
+                    print(f"Warning: {col} found in data but not in FIXED_CATEGORIES. Using dynamic categories.")
+                    dummies = pd.get_dummies(df[col].fillna('UNKNOWN'), prefix=col)
+                    
+                    # Limit to top 10 categories if there are too many
+                    if len(dummies.columns) > 10:
+                        top_cats = df[col].value_counts().nlargest(10).index
+                        keep_cols = [f"{col}_{c}" for c in top_cats]
+                        dummies = dummies[keep_cols]
+                    
+                    for dummy_col in dummies.columns:
+                        features.append(dummies[dummy_col].values)
+            else:
+                # If the column is missing, create all-zero dummies (one for each fixed category)
+                if col in FIXED_CATEGORIES:
+                    for _ in FIXED_CATEGORIES[col]:
+                        features.append(np.zeros(len(df)))
+    
+        # --- 3. Timestamp Features ---
+        timestamps_tensor = None
+        
+        # Process the first valid timestamp column according to priority
+        for ts_col in FEATURE_SCHEMA['timestamp']:
+            if ts_col in df.columns and timestamps_tensor is None:
+                try:
+                    # Convert to datetime and extract features
+                    timestamps = pd.to_datetime(df[ts_col], errors='coerce')
+                    
+                    if timestamps.isna().all():
+                        print(f"Warning: All values in {ts_col} are NaT. Trying next column.")
+                        continue
+                        
+                    # Fill NaT with median
+                    timestamps = timestamps.fillna(timestamps.median())
+                    
+                    # Cyclical encoding for month (1-12)
                     month = timestamps.dt.month.values.astype(float)
                     month_sin = np.sin(2 * np.pi * month / 12)
                     month_cos = np.cos(2 * np.pi * month / 12)
                     features.append(month_sin)
                     features.append(month_cos)
                     
-                    # Day of week as cyclical feature
+                    # Cyclical encoding for day of week (0-6)
                     day_of_week = timestamps.dt.dayofweek.values.astype(float)
                     dow_sin = np.sin(2 * np.pi * day_of_week / 7)
                     dow_cos = np.cos(2 * np.pi * day_of_week / 7)
                     features.append(dow_sin)
                     features.append(dow_cos)
                     
-                    # Hour of day (if available with time component)
+                    # Cyclical encoding for hour (if available)
                     if timestamps.dt.hour.max() > 0:
                         hour = timestamps.dt.hour.values.astype(float)
                         hour_sin = np.sin(2 * np.pi * hour / 24)
                         hour_cos = np.cos(2 * np.pi * hour / 24)
                         features.append(hour_sin)
                         features.append(hour_cos)
+                    
+                    # Store timestamp values for sequence creation
+                    timestamps_int = timestamps.astype('int64') // 10**9
+                    timestamps_tensor = torch.tensor(timestamps_int.values, dtype=torch.float32)
+                    
+                    print(f"Successfully processed timestamp features from {ts_col}")
+                    break
                 except Exception as e:
-                    print(f"Error extracting timestamp features from {ts_col}: {str(e)}")
-                    pass
+                    print(f"Error processing {ts_col}: {e}. Trying next column.")
+                    continue
+    
+        # --- 4. Create Feature Matrix ---
+        if not features:
+            print("Warning: No features extracted. Creating dummy features.")
+            feature_matrix = np.zeros((len(df), 1))
+        else:
+            feature_matrix = np.column_stack(features)  # Stack features horizontally
         
-        # Combine features into a matrix
-        feature_matrix = np.column_stack(features) if features else np.zeros((len(df), 1))
-        
-        # Print the number of features extracted
         print(f"Extracted {feature_matrix.shape[1]} features from transaction data")
-        
-        # Ensure we have at least 128 features for the model's input projection
-        if feature_matrix.shape[1] < 128:
-            print(f"Padding feature matrix from {feature_matrix.shape[1]} to 128 dimensions")
-            padded_matrix = np.zeros((len(df), 128))
+    
+        # --- 5. Padding (After Fixed Feature Extraction) ---
+        if feature_matrix.shape[1] < INPUT_FEATURE_DIM:
+            print(f"Padding feature matrix from {feature_matrix.shape[1]} to {INPUT_FEATURE_DIM} dimensions")
+            padded_matrix = np.zeros((len(df), INPUT_FEATURE_DIM))
             padded_matrix[:, :feature_matrix.shape[1]] = feature_matrix
             feature_matrix = padded_matrix
-            
-        node_features = torch.tensor(feature_matrix, dtype=torch.float)
+        elif feature_matrix.shape[1] > INPUT_FEATURE_DIM:  # Also truncate if it's too large
+            print(f"Truncating feature matrix from {feature_matrix.shape[1]} to {INPUT_FEATURE_DIM} dimensions")
+            feature_matrix = feature_matrix[:, :INPUT_FEATURE_DIM]
+    
+        node_features = torch.tensor(feature_matrix, dtype=torch.float32)
         
-        # Create sequence features from node features (simplified approach)
-        batch_size = min(len(df), 128)  # Match the actual batch size in your data (128 from error message)
-        seq_len = 5  # Fixed sequence length for simplicity
-        
-        # Create dummy sequence features - make sure dimensions match!
-        seq_features = torch.zeros((batch_size, seq_len, node_features.shape[1]))
-        for i in range(batch_size):
-            # For each batch item, get a sequence of transactions
-            start_idx = i
-            for j in range(seq_len):
-                if start_idx + j < len(df):  # Prevent index out of bounds
-                    idx = start_idx + j
-                else:
-                    idx = start_idx  # Reuse the start index as fallback
-                seq_features[i, j] = node_features[idx]
-        
-        # Create timestamps with enhanced stability and error handling
-        # First, prioritize checking for generated_timestamp explicitly
-        timestamps_tensor = None
-        
-        if 'generated_timestamp' in df.columns:
-            try:
-                print("Found 'generated_timestamp' column - attempting to use it")
-                # Convert to pandas datetime with error handling
-                timestamps = pd.to_datetime(df['generated_timestamp'], errors='coerce')
-                
-                # Check if conversion worked
-                if timestamps.isna().all():
-                    raise ValueError("All timestamp values are NaN after conversion")
-                    
-                # Fill NaT values with median timestamp to avoid NaN propagation
-                median_ts = timestamps.median()
-                timestamps = timestamps.fillna(median_ts)
-                
-                # Convert to seconds since epoch (float)
-                timestamps_int = timestamps.astype('int64') // 10**9  # Integer division for stability
-                
-                # Normalize to avoid extreme values
-                min_ts = timestamps_int.min()
-                timestamps_norm = timestamps_int - min_ts  # Make relative to minimum
-                
-                # Get the available timestamps as a numpy array
-                ts_array = timestamps_norm.to_numpy().astype(np.float32)
-                ts_array = np.nan_to_num(ts_array, nan=0.0)
-                
-                # Even if we don't have enough timestamps for full batch*seq_len,
-                # we can still create meaningful temporal batches from what we have
-                print(f"Available timestamps: {len(ts_array)} for desired shape ({batch_size}x{seq_len})")
-                
-                # Check if we can create company-based temporal sequences
-                if 'company_id' in df.columns:
-                    print("Using company_id to create meaningful business-related temporal sequences")
-                    # Group transactions by company to preserve business entity relationships
-                    company_groups = df.groupby('company_id')
-                    companies = list(company_groups.groups.keys())
-                    
-                    # Determine batch size based on available data
-                    actual_batch_size = min(batch_size, len(companies))
-                    print(f"Using {actual_batch_size} companies for temporal sequences")
-                    
-                    # Initialize tensor - this will be reshaped later if needed
-                    all_company_sequences = []
-                    
-                    # Track the longest valid sequence for later padding
-                    max_valid_seq_len = 0
-                    
-                    # For each company, create a proper temporal sequence using their real timestamps
-                    for company_idx, company in enumerate(companies):
-                        if company_idx >= actual_batch_size:
-                            break
-                            
-                        # Get this company's actual transactions and timestamps
-                        company_df = company_groups.get_group(company)
-                        
-                        # Sort timestamps chronologically to preserve true temporal patterns
-                        company_ts = timestamps_norm[company_df.index].sort_values()
-                        
-                        # Use actual temporal sequences when available
-                        if len(company_ts) > 0:
-                            # Convert to numpy array with proper type handling
-                            company_ts_array = company_ts.to_numpy().astype(np.float32)
-                            
-                            # Use actual sequence length based on available data
-                            valid_seq_len = min(seq_len, len(company_ts_array))
-                            max_valid_seq_len = max(max_valid_seq_len, valid_seq_len)
-                            
-                            # Create a proper temporal sequence using chronologically ordered values
-                            # This preserves the true temporal patterns within this company's transactions
-                            temp_array = [float(company_ts_array[j]) for j in range(valid_seq_len)]
-                            
-                            # Save this company's temporal sequence
-                            all_company_sequences.append(temp_array)
-                    
-                    # Now create properly sized tensor with the available sequences
-                    # First, make sure all sequences have the same length through padding
-                    padded_sequences = []
-                    for seq in all_company_sequences:
-                        if len(seq) < max_valid_seq_len:
-                            # Pad with last timestamp + small increment to maintain temporal order
-                            last_val = seq[-1] if seq else 0.0
-                            padded = seq + [float(last_val + i + a) for i, a in 
-                                          enumerate(np.random.random(max_valid_seq_len - len(seq))*0.1)]
-                            padded_sequences.append(padded)
-                        else:
-                            padded_sequences.append(seq)
-                    
-                    # Create final timestamps tensor
-                    # Match batch size by duplicating sequences if needed
-                    final_sequences = []
-                    for i in range(batch_size):
-                        seq_idx = i % len(padded_sequences)
-                        final_sequences.append(padded_sequences[seq_idx])
-                    
-                    # Convert to tensor, handling proper dimensions
-                    timestamps_tensor = torch.tensor(final_sequences, dtype=torch.float32)
-                    
-                    # Add slight noise to duplicated sequences to avoid exact duplication
-                    if len(padded_sequences) < batch_size:
-                        # Add small noise to maintain temporal character while avoiding duplication
-                        noise = torch.randn_like(timestamps_tensor) * 0.01
-                        timestamps_tensor = timestamps_tensor + noise
-                    
-                    print(f"Created temporal sequences from {len(companies)} companies with proper chronology")
-                    
-                else:
-                    print("No company_id for grouping - preserving natural temporal ordering")
-                    # Sort timestamps to maintain chronological order
-                    sorted_ts = np.sort(ts_array)
-                    
-                    # Calculate how many complete sequences we can make
-                    num_complete_seqs = len(sorted_ts) // seq_len
-                    
-                    # Determine how many sequences we need to duplicate
-                    actual_batch_size = min(batch_size, max(1, num_complete_seqs))
-                    print(f"Can create {num_complete_seqs} complete temporal sequences")
-                    
-                    # Create sequences with actual chronological ordering
-                    timestamps_tensor = torch.zeros((batch_size, seq_len), dtype=torch.float32)
-                    
-                    # Fill available complete sequences
-                    for i in range(min(batch_size, num_complete_seqs)):
-                        start_idx = i * seq_len
-                        seq_array = sorted_ts[start_idx:start_idx+seq_len]
-                        timestamps_tensor[i] = torch.tensor([float(x) for x in seq_array], dtype=torch.float32)
-                    
-                    # If we need more sequences, duplicate with small variations
-                    if num_complete_seqs < batch_size:
-                        for i in range(num_complete_seqs, batch_size):
-                            # Cycle through available sequences with small noise
-                            source_idx = i % max(1, num_complete_seqs)
-                            base_seq = timestamps_tensor[source_idx].clone()
-                            
-                            # Add small noise to maintain temporal character
-                            noise = torch.randn_like(base_seq) * 0.01
-                            timestamps_tensor[i] = base_seq + noise
-                
-                print(f"Successfully created timestamps tensor with shape {timestamps_tensor.shape}")
-                
-            except Exception as e:
-                print(f"Error processing generated_timestamp: {str(e)}")
-                print("Falling back to other timestamp columns...")
-                # Fall through to the default timestamp handling below
-                timestamps_tensor = None
-        else:
-            # No generated_timestamp found
-            timestamps_tensor = None
-            
-        # Try other timestamp columns if generated_timestamp processing failed
+        # Adjust batch size if needed
+        batch_size = min(len(df), batch_size)
+    
+        # --- 6. Timestamp Handling (if not already created) ---
         if timestamps_tensor is None:
-            timestamp_tried = False
-            # Check for any timestamp column
-            for ts_col in ['timestamp', 'books_create_timestamp', 'update_timestamp']:
-                if ts_col in df.columns:
-                    timestamp_tried = True
-                    try:
-                        print(f"Trying timestamp column: {ts_col}")
-                        # Convert to pandas datetime with error handling
-                        timestamps = pd.to_datetime(df[ts_col], errors='coerce')
-                        
-                        # Check if we have any valid timestamps after conversion
-                        if timestamps.isna().all():
-                            print(f"All values in {ts_col} are NaN after conversion, trying next column")
-                            continue
-                        
-                        # Fill NaT values with median timestamp to avoid NaN propagation
-                        median_ts = timestamps.median()
-                        timestamps = timestamps.fillna(median_ts)
-                        
-                        # Convert to seconds since epoch as float directly
-                        timestamps_int = timestamps.astype('int64') // 10**9  # Integer division for stability
-                        
-                        # Normalize to avoid extreme values
-                        min_ts = timestamps_int.min()
-                        timestamps_norm = timestamps_int - min_ts  # Make relative to minimum
-                        
-                        # Get the available timestamps as a numpy array
-                        ts_array = timestamps_norm.to_numpy().astype(np.float32)
-                        ts_array = np.nan_to_num(ts_array, nan=0.0)
-                        
-                        # Same improved timestamp handling as with generated_timestamp
-                        print(f"Available {ts_col} values: {len(ts_array)} for desired shape ({batch_size}x{seq_len})")
-                        
-                        # Check if we can group by company
-                        if 'company_id' in df.columns:
-                            print(f"Using company_id to create meaningful business-related temporal sequences")
-                            # Group transactions by company to preserve business entity relationships
-                            company_groups = df.groupby('company_id')
-                            companies = list(company_groups.groups.keys())
-                            
-                            # Determine batch size based on available data
-                            actual_batch_size = min(batch_size, len(companies))
-                            print(f"Using {actual_batch_size} companies for temporal sequences")
-                            
-                            # Initialize tensor - this will be reshaped later if needed
-                            all_company_sequences = []
-                            
-                            # Track the longest valid sequence for later padding
-                            max_valid_seq_len = 0
-                            
-                            # For each company, create a proper temporal sequence using their real timestamps
-                            for company_idx, company in enumerate(companies):
-                                if company_idx >= actual_batch_size:
-                                    break
-                                    
-                                # Get this company's actual transactions and timestamps
-                                company_df = company_groups.get_group(company)
-                                
-                                # Sort timestamps chronologically to preserve true temporal patterns
-                                company_ts = timestamps_norm[company_df.index].sort_values()
-                                
-                                # Use actual temporal sequences when available
-                                if len(company_ts) > 0:
-                                    # Convert to numpy array with proper type handling
-                                    company_ts_array = company_ts.to_numpy().astype(np.float32)
-                                    
-                                    # Use actual sequence length based on available data
-                                    valid_seq_len = min(seq_len, len(company_ts_array))
-                                    max_valid_seq_len = max(max_valid_seq_len, valid_seq_len)
-                                    
-                                    # Create a proper temporal sequence using chronologically ordered values
-                                    # This preserves the true temporal patterns within this company's transactions
-                                    temp_array = [float(company_ts_array[j]) for j in range(valid_seq_len)]
-                                    
-                                    # Save this company's temporal sequence
-                                    all_company_sequences.append(temp_array)
-                            
-                            # Now create properly sized tensor with the available sequences
-                            # First, make sure all sequences have the same length through padding
-                            padded_sequences = []
-                            for seq in all_company_sequences:
-                                if len(seq) < max_valid_seq_len:
-                                    # Pad with last timestamp + small increment to maintain temporal order
-                                    last_val = seq[-1] if seq else 0.0
-                                    padded = seq + [float(last_val + i + np.random.random()*0.1) for i in range(max_valid_seq_len - len(seq))]
-                                    padded_sequences.append(padded)
-                                else:
-                                    padded_sequences.append(seq)
-                            
-                            # Create final timestamps tensor
-                            # Match batch size by duplicating sequences if needed
-                            final_sequences = []
-                            for i in range(batch_size):
-                                seq_idx = i % len(padded_sequences) if padded_sequences else 0
-                                if padded_sequences:
-                                    final_sequences.append(padded_sequences[seq_idx])
-                                else:
-                                    # Fallback if no sequences could be created
-                                    final_sequences.append([float(j) for j in range(seq_len)])
-                            
-                            # Convert to tensor, handling proper dimensions
-                            timestamps_tensor = torch.tensor(final_sequences, dtype=torch.float32)
-                            
-                            # Add slight noise to duplicated sequences to avoid exact duplication
-                            if len(padded_sequences) < batch_size and len(padded_sequences) > 0:
-                                # Add small noise to maintain temporal character while avoiding duplication
-                                noise = torch.randn_like(timestamps_tensor) * 0.01
-                                timestamps_tensor = timestamps_tensor + noise
-                            
-                            print(f"Created temporal sequences from {len(companies)} companies with proper chronology")
-                            
-                        else:
-                            print("No company_id for grouping - preserving natural temporal ordering")
-                            # Sort timestamps to maintain chronological order
-                            sorted_ts = np.sort(ts_array)
-                            
-                            # Calculate how many complete sequences we can make
-                            num_complete_seqs = len(sorted_ts) // seq_len
-                            
-                            # Determine how many sequences we need to duplicate
-                            actual_batch_size = min(batch_size, max(1, num_complete_seqs))
-                            print(f"Can create {num_complete_seqs} complete temporal sequences")
-                            
-                            # Create sequences with actual chronological ordering
-                            timestamps_tensor = torch.zeros((batch_size, seq_len), dtype=torch.float32)
-                            
-                            # Fill available complete sequences
-                            for i in range(min(batch_size, num_complete_seqs)):
-                                start_idx = i * seq_len
-                                if start_idx + seq_len <= len(sorted_ts):
-                                    seq_array = sorted_ts[start_idx:start_idx+seq_len]
-                                    timestamps_tensor[i] = torch.tensor([float(x) for x in seq_array], dtype=torch.float32)
-                            
-                            # If we need more sequences, duplicate with small variations
-                            if num_complete_seqs < batch_size:
-                                for i in range(num_complete_seqs, batch_size):
-                                    # Cycle through available sequences with small noise
-                                    source_idx = i % max(1, num_complete_seqs)
-                                    base_seq = timestamps_tensor[source_idx].clone()
-                                    
-                                    # Add small noise to maintain temporal character
-                                    noise = torch.randn_like(base_seq) * 0.01
-                                    timestamps_tensor[i] = base_seq + noise
-                        
-                        print(f"Successfully using {ts_col} for timestamps with proper temporal sequences")
-                        break
-                    except Exception as e:
-                        print(f"Error processing {ts_col}: {str(e)}")
-                        continue
-            
-            # If all timestamp columns failed or none found, use synthetic timestamps
-            if timestamps_tensor is None:
-                if timestamp_tried:
-                    print("All timestamp columns failed processing. Using synthetic timestamps.")
-                else:
-                    print("No timestamp columns found. Using synthetic timestamps.")
+            print("Warning: No valid timestamp columns found. Generating synthetic timestamps.")
+            # Fallback: Synthetic Timestamps
+            if 'company_id' in df.columns:
+                # Group by company and generate sequential timestamps within each group
+                company_ids = pd.factorize(df['company_id'])[0]
+                company_ids_tensor = torch.tensor(company_ids, dtype=torch.long)
                 
-                # Check if we have company_id to create company-based sequences
-                if 'company_id' in df.columns:
-                    print("Creating company-based synthetic timestamps")
-                    company_groups = df.groupby('company_id')
-                    companies = list(company_groups.groups.keys())
-                    
-                    # Initialize timestamps tensor
-                    timestamps_tensor = torch.zeros((batch_size, seq_len), dtype=torch.float32)
-                    
-                    # For each batch, use one company's transactions
-                    for i in range(batch_size):
-                        # Select a company (cycling if needed)
-                        company_idx = i % len(companies)
-                        
-                        # Generate timestamps that mimic real transaction patterns
-                        # Each company batch should have its own business day pattern
-                        
-                        # Create realistic business day pattern
-                        # Start from a random time during business hours
-                        base_time = i * 24 * 3600  # Start each company on a different day
-                        business_start = 9 * 3600  # 9 AM in seconds
-                        business_hours = 8 * 3600  # 8 business hours in seconds
-                        
-                        temp_array = []
-                        last_time = base_time + business_start + np.random.random() * business_hours
-                        
-                        # Simulate transactions happening over multiple business days with realistic patterns
-                        for j in range(seq_len):
-                            if j > 0:
-                                # Time between transactions varies but follows business patterns
-                                # Shorter gaps during business hours, longer gaps overnight
-                                hour_of_day = (last_time / 3600) % 24
-                                
-                                if 9 <= hour_of_day < 17:  # Business hours 9 AM - 5 PM
-                                    # Frequent transactions during business hours
-                                    time_gap = np.random.exponential(1800)  # avg 30 min between transactions
-                                elif 17 <= hour_of_day < 20:  # Evening hours
-                                    # Less frequent transactions in evening
-                                    time_gap = np.random.exponential(7200)  # avg 2 hours
-                                else:  # Overnight
-                                    # Skip to next business day
-                                    time_gap = (24 - hour_of_day + 9 + np.random.random() * 2) * 3600
-                                
-                                last_time += time_gap
-                            
-                            temp_array.append(float(last_time))
-                        
-                        # Normalize to avoid extremely large values
-                        min_val = min(temp_array)
-                        normalized = [t - min_val for t in temp_array]
-                        
-                        timestamps_tensor[i] = torch.tensor(normalized, dtype=torch.float32)
-                    
-                    print(f"Created company-based synthetic timestamps with shape {timestamps_tensor.shape}")
-                    
-                else:
-                    print("Creating pure synthetic temporal sequences")
-                    # Create synthetic timestamps that mimic transaction patterns
-                    # Initialize a tensor to store synthetic timestamps
-                    timestamps_tensor = torch.zeros((batch_size, seq_len), dtype=torch.float32)
-                    
-                    # Generate a chronological sequence for each batch with realistic transaction patterns
-                    for i in range(batch_size):
-                        # Create a sequence that mimics real transaction patterns
-                        # Start from a base time plus a random offset
-                        base_time = i * 24 * 3600  # Different starting day for each sequence
-                        
-                        # Create a realistic pattern of transactions over time
-                        temp_array = []
-                        last_time = base_time
-                        
-                        # First transaction starts at a random time
-                        business_hours_start = 8 * 3600  # 8 AM
-                        business_hours_end = 18 * 3600  # 6 PM
-                        initial_time = base_time + business_hours_start + np.random.random() * (business_hours_end - business_hours_start)
-                        temp_array.append(float(initial_time))
-                        
-                        # Generate subsequent transactions with time patterns following business logic
-                        for j in range(1, seq_len):
-                            last_time = temp_array[-1]
-                            
-                            # Get the hour of the day for the last transaction
-                            hour_of_day = (last_time / 3600) % 24
-                            
-                            # Different time gaps based on time of day
-                            if 8 <= hour_of_day < 12:  # Morning business hours
-                                time_gap = np.random.exponential(3600)  # ~1 hour average
-                            elif 12 <= hour_of_day < 14:  # Lunch hours
-                                time_gap = np.random.exponential(1800)  # ~30 min average
-                            elif 14 <= hour_of_day < 18:  # Afternoon business hours
-                                time_gap = np.random.exponential(3600)  # ~1 hour average
-                            elif 18 <= hour_of_day < 22:  # Evening hours
-                                time_gap = np.random.exponential(7200)  # ~2 hours average
-                            else:  # Night time
-                                # Skip to next business day morning
-                                next_morning = base_time + ((int(last_time / 86400) + 1) * 86400) + business_hours_start
-                                next_morning += np.random.random() * 3600  # Random start in first business hour
-                                time_gap = next_morning - last_time
-                            
-                            next_time = last_time + time_gap
-                            temp_array.append(float(next_time))
-                        
-                        # Normalize times to avoid extremely large values
-                        min_val = min(temp_array)
-                        normalized = [t - min_val for t in temp_array]
-                        
-                        # Store in timestamps tensor
-                        timestamps_tensor[i] = torch.tensor(normalized, dtype=torch.float32)
-                    
-                    # Add batch-level statistics for clarity
-                    print(f"Created synthetic temporal sequences with shape {timestamps_tensor.shape}")
+                timestamps_tensor = torch.zeros(len(df), dtype=torch.float32)
+                for company_id in torch.unique(company_ids_tensor):
+                    company_indices = (company_ids_tensor == company_id).nonzero(as_tuple=True)[0]
+                    timestamps_tensor[company_indices] = torch.arange(len(company_indices), dtype=torch.float32)
+            else:
+                # Completely synthetic, sequential timestamps
+                timestamps_tensor = torch.arange(len(df), dtype=torch.float32)
+    
+        # --- 7. Create sequence features with aligned company_ids ---
+        seq_features = []
+        seq_company_ids = []
         
-        # Final safety check - replace any remaining NaNs and extreme values
-        timestamps_tensor = torch.nan_to_num(timestamps_tensor, nan=0.0, posinf=1e5, neginf=0.0)
-        timestamps_tensor = torch.clamp(timestamps_tensor, min=0.0, max=1e5)
+        # Create sequences of features with matching company_ids
+        for start_idx in range(0, len(df), seq_len):
+            end_idx = min(start_idx + seq_len, len(df))
+            seq = node_features[start_idx:end_idx]
+    
+            # Padding for sequence length (if needed)
+            if len(seq) < seq_len:
+                padding = torch.zeros((seq_len - len(seq), node_features.shape[1]), dtype=torch.float32)
+                seq = torch.cat([seq, padding], dim=0)
+    
+            seq_features.append(seq)
+            
+            # Create corresponding company_ids sequence
+            if company_ids_tensor is not None:
+                # Extract company_ids for this sequence and pad if needed
+                company_seq = company_ids_tensor[start_idx:end_idx]
+                if len(company_seq) < seq_len:
+                    # Pad with last company_id to maintain company identity
+                    last_id = company_seq[-1] if len(company_seq) > 0 else 0
+                    padding = torch.full((seq_len - len(company_seq),), last_id, dtype=torch.long)
+                    company_seq = torch.cat([company_seq, padding], dim=0)
+                seq_company_ids.append(company_seq)
         
-        # Create tabular features
-        tabular_features = node_features[:batch_size].clone()
+        # Handle case with no full sequence
+        if not seq_features:
+            seq_features = [torch.zeros((seq_len, node_features.shape[1]), dtype=torch.float32)]
+            if company_ids_tensor is not None:
+                seq_company_ids = [torch.zeros(seq_len, dtype=torch.long)]
+            
+        # Stack sequences
+        seq_features = torch.stack(seq_features)
         
-        # Prepare company features if available
+        # Stack company_ids sequences if available
+        if company_ids_tensor is not None and seq_company_ids:
+            seq_company_ids_tensor = torch.stack(seq_company_ids)
+            print(f"Created seq_company_ids_tensor with shape: {seq_company_ids_tensor.shape}")
+        else:
+            seq_company_ids_tensor = None
+    
+        # --- 8. Sequence Timestamps (Consistent with Padding) ---
+        seq_timestamps = []
+        for start_idx in range(0, len(df), seq_len):
+            end_idx = min(start_idx + seq_len, len(df))
+            seq = timestamps_tensor[start_idx:end_idx]
+    
+            if len(seq) < seq_len:
+                padding = torch.zeros((seq_len-len(seq),), dtype=torch.float32)
+                seq = torch.cat([seq, padding], dim=0)
+            seq_timestamps.append(seq)
+            
+        # Handle case with no full sequence
+        if not seq_timestamps:
+            seq_timestamps = [torch.zeros((seq_len,), dtype=torch.float32)]
+            
+        seq_timestamps = torch.stack(seq_timestamps)
+    
+        # --- 9. Tabular Features (First `batch_size` rows from node_features) ---
+        # Assuming batch_size is the number of sequences
+        batch_size = min(batch_size, seq_features.shape[0])
+        tabular_features = node_features[:batch_size]
+    
+        # --- 10. Company Features (If Applicable) ---
         company_features = None
-        if 'company_type' in df.columns or 'company_size' in df.columns:
+        if 'company_type' in df.columns and 'company_size' in df.columns:
             company_feats = []
             
-            # One-hot encode company type
-            if 'company_type' in df.columns:
-                company_types = pd.get_dummies(df['company_type'])
-                company_feats.append(company_types.values)
-                
-            # One-hot encode company size
-            if 'company_size' in df.columns:
-                company_sizes = pd.get_dummies(df['company_size'])
-                company_feats.append(company_sizes.values)
-                
-            # Combine features
-            company_feat_matrix = np.hstack(company_feats)
-            company_features = torch.tensor(company_feat_matrix[:batch_size], dtype=torch.float)
-        
-        # Package data
+            # Process company_type
+            company_type = df['company_type'].fillna('UNKNOWN').astype(str).str.upper()
+            company_type = company_type.apply(lambda x: x if x in FIXED_CATEGORIES['company_type'] else 'UNKNOWN')
+            company_type_cat = pd.Categorical(company_type, categories=FIXED_CATEGORIES['company_type'])
+            company_type_dummies = pd.get_dummies(company_type_cat, prefix='company_type')
+            
+            # Process company_size
+            company_size = df['company_size'].fillna('UNKNOWN').astype(str).str.upper()
+            company_size = company_size.apply(lambda x: x if x in FIXED_CATEGORIES['company_size'] else 'UNKNOWN')
+            company_size_cat = pd.Categorical(company_size, categories=FIXED_CATEGORIES['company_size'])
+            company_size_dummies = pd.get_dummies(company_size_cat, prefix='company_size')
+            
+            # Combine all company features
+            for cat in FIXED_CATEGORIES['company_type']:
+                col_name = f'company_type_{cat}'
+                if col_name in company_type_dummies.columns:
+                    company_feats.append(company_type_dummies[col_name].values)
+                else:
+                    company_feats.append(np.zeros(len(df)))
+    
+            for cat in FIXED_CATEGORIES['company_size']:
+                col_name = f'company_size_{cat}'
+                if col_name in company_size_dummies.columns:
+                    company_feats.append(company_size_dummies[col_name].values)
+                else:
+                    company_feats.append(np.zeros(len(df)))
+    
+            if company_feats:
+                company_feat_matrix = np.column_stack(company_feats)
+                company_features = torch.tensor(company_feat_matrix, dtype=torch.float32)
+    
+        # --- 11. Return Data Dictionary ---
         data = {
-            'x': node_features,
-            'edge_index': edge_index,
-            'edge_type': edge_type,
-            'edge_attr': edge_attr,
-            'seq_features': seq_features,
-            'timestamps': timestamps_tensor,
+            'x': node_features,  # Match forward method parameter 'x' instead of 'node_features'
+            'seq_features': seq_features[:batch_size],  # Limit to actual batch size
             'tabular_features': tabular_features,
-            't0': 0.0,  # Dummy value
-            't1': 1.0,  # Dummy value
+            'timestamps': seq_timestamps[:batch_size],  # Limit to actual batch size
+            'edge_index': edge_index,
+            'edge_attr': edge_attr,
+            'edge_type': edge_type,
             'company_features': company_features,
-            'company_ids': company_ids_tensor,
+            # Use properly formatted sequence of company_ids if available
+            'company_ids': seq_company_ids_tensor[:batch_size] if (seq_company_ids_tensor is not None) else company_ids_tensor,
+            't0': 0.0,  # Start time for ODE integration
+            't1': 1.0,  # End time for ODE integration
             'batch_size': batch_size,
             'seq_len': seq_len
         }
         
+        # Log company_ids information for debugging
+        if 'company_ids' in data and data['company_ids'] is not None:
+            company_ids_shape = data['company_ids'].shape
+            print(f"Returning company_ids with shape: {company_ids_shape}")
+            if len(company_ids_shape) >= 2:
+                print(f"Properly formatted for DynamicContextualTemporal with batch_size={company_ids_shape[0]}, seq_len={company_ids_shape[1]}")
+            else:
+                print(f"WARNING: company_ids has unexpected shape {company_ids_shape} - DynamicContextualTemporal may use standard approach")
+        else:
+            print("WARNING: No company_ids available for DynamicContextualTemporal")
+            
         return data
+        
+    def _create_sequence_features(self, df, node_features, batch_size, seq_len):
+        """Helper method to create sequence features with improved temporal coherence"""
+        # Try to group by company_id for better temporal sequences if available
+        if 'company_id' in df.columns:
+            print("Creating company-grouped sequence features")
+            company_groups = df.groupby('company_id')
+            companies = list(company_groups.groups.keys())
+            
+            # Initialize sequence features tensor
+            seq_features = torch.zeros((batch_size, seq_len, node_features.shape[1]))
+            
+            for i in range(batch_size):
+                # Select a company (cycle if needed)
+                company_idx = i % len(companies)
+                company = companies[company_idx]
+                
+                # Get indices for this company
+                indices = company_groups.get_group(company).index.tolist()
+                
+                # Sort by timestamp if available
+                if any(col in df.columns for col in ['timestamp', 'generated_timestamp', 'books_create_timestamp']):
+                    ts_col = next(col for col in ['timestamp', 'generated_timestamp', 'books_create_timestamp'] 
+                                 if col in df.columns)
+                    try:
+                        # Sort indices by timestamp
+                        ts_series = pd.to_datetime(df.loc[indices, ts_col], errors='coerce')
+                        ts_series = ts_series.fillna(ts_series.median())
+                        sorted_indices = [idx for _, idx in sorted(zip(ts_series, indices))]
+                        indices = sorted_indices
+                    except Exception as e:
+                        print(f"Error sorting by timestamp: {e}")
+                
+                # Take up to seq_len transactions from this company
+                valid_len = min(seq_len, len(indices))
+                
+                # Use available transactions and pad if needed
+                for j in range(seq_len):
+                    if j < valid_len:
+                        seq_features[i, j] = node_features[indices[j]]
+                    else:
+                        # Padding - use last valid transaction
+                        seq_features[i, j] = node_features[indices[valid_len-1]]
+        else:
+            print("Creating standard sequence features (no company grouping available)")
+            # Standard approach - create sequences from consecutive records
+            seq_features = torch.zeros((batch_size, seq_len, node_features.shape[1]))
+            
+            for i in range(batch_size):
+                start_idx = min(i * seq_len, max(0, len(df) - seq_len))
+                
+                for j in range(seq_len):
+                    if start_idx + j < len(df):
+                        seq_features[i, j] = node_features[start_idx + j]
+                    else:
+                        # Padding with repeated last transaction
+                        last_valid = min(start_idx + max(0, j-1), len(df)-1)
+                        seq_features[i, j] = node_features[last_valid]
+        
+        return seq_features
+    
+    def _create_timestamps(self, df, batch_size, seq_len):
+        """Helper method to create timestamp tensor with improved handling"""
+        timestamps_tensor = None
+        
+        # Try each timestamp column in order of preference
+        timestamp_columns = ['generated_timestamp', 'timestamp', 'books_create_timestamp', 
+                           'update_timestamp', 'transaction_date']
+        
+        for ts_col in timestamp_columns:
+            if ts_col in df.columns and timestamps_tensor is None:
+                try:
+                    print(f"Trying to create timestamps from {ts_col}")
+                    # Convert to datetime with error handling
+                    timestamps = pd.to_datetime(df[ts_col], errors='coerce')
+                    
+                    # Skip if all timestamps are NaT
+                    if timestamps.isna().all():
+                        print(f"All values in {ts_col} are NaN after conversion, trying next column")
+                        continue
+                    
+                    # Fill NaT values with median timestamp
+                    median_ts = timestamps.median()
+                    timestamps = timestamps.fillna(median_ts)
+                    
+                    # Convert to seconds since epoch for numerical processing
+                    timestamps_int = timestamps.astype('int64') // 10**9
+                    
+                    # Normalize to avoid extreme values
+                    min_ts = timestamps_int.min()
+                    timestamps_norm = timestamps_int - min_ts
+                    
+                    # Check if we can group by company_id
+                    if 'company_id' in df.columns:
+                        timestamps_tensor = self._create_company_grouped_timestamps(
+                            df, timestamps_norm, batch_size, seq_len)
+                    else:
+                        timestamps_tensor = self._create_sequential_timestamps(
+                            timestamps_norm, batch_size, seq_len)
+                    
+                    print(f"Successfully created timestamps tensor with shape {timestamps_tensor.shape}")
+                    break
+                    
+                except Exception as e:
+                    print(f"Error processing {ts_col}: {e}")
+                    continue
+        
+        # If all timestamp columns failed or none found, use synthetic timestamps
+        if timestamps_tensor is None:
+            print("No valid timestamp columns found. Using synthetic timestamps.")
+            timestamps_tensor = self._create_synthetic_timestamps(df, batch_size, seq_len)
+        
+        # Final safety check - replace any NaNs and extreme values
+        timestamps_tensor = torch.nan_to_num(timestamps_tensor, nan=0.0, posinf=1e5, neginf=0.0)
+        timestamps_tensor = torch.clamp(timestamps_tensor, min=0.0, max=1e5)
+        
+        return timestamps_tensor
+    
+    def _create_company_grouped_timestamps(self, df, timestamps_norm, batch_size, seq_len):
+        """Create timestamps grouped by company for better business-related patterns"""
+        print("Creating company-grouped timestamps")
+        company_groups = df.groupby('company_id')
+        companies = list(company_groups.groups.keys())
+        
+        # Determine how many companies we can use
+        actual_batch_size = min(batch_size, len(companies))
+        print(f"Using {actual_batch_size} companies for temporal sequences")
+        
+        # Initialize collection of company sequences
+        all_company_sequences = []
+        max_valid_seq_len = 0
+        
+        # Process each company
+        for company_idx, company in enumerate(companies):
+            if company_idx >= actual_batch_size:
+                break
+                
+            # Get company's transactions and their timestamps
+            company_df = company_groups.get_group(company)
+            company_ts = timestamps_norm[company_df.index].sort_values()
+            
+            if len(company_ts) > 0:
+                # Convert to numpy array
+                company_ts_array = company_ts.to_numpy().astype(np.float32)
+                
+                # Use actual sequence length based on available data
+                valid_seq_len = min(seq_len, len(company_ts_array))
+                max_valid_seq_len = max(max_valid_seq_len, valid_seq_len)
+                
+                # Create chronologically ordered sequence
+                temp_array = [float(company_ts_array[j]) for j in range(valid_seq_len)]
+                all_company_sequences.append(temp_array)
+        
+        # If no valid sequences were created, return synthetic ones
+        if not all_company_sequences:
+            return self._create_synthetic_timestamps(df, batch_size, seq_len)
+        
+        # Ensure all sequences have the same length
+        padded_sequences = []
+        for seq in all_company_sequences:
+            if len(seq) < max_valid_seq_len:
+                # Pad with last timestamp + small increment to maintain temporal order
+                last_val = seq[-1] if seq else 0.0
+                padding = [float(last_val + i + 0.01) for i in range(max_valid_seq_len - len(seq))]
+                padded_sequences.append(seq + padding)
+            else:
+                padded_sequences.append(seq)
+        
+        # Create final timestamps tensor
+        final_sequences = []
+        for i in range(batch_size):
+            seq_idx = i % len(padded_sequences)
+            final_sequences.append(padded_sequences[seq_idx])
+        
+        # Convert to tensor
+        timestamps_tensor = torch.tensor(final_sequences, dtype=torch.float32)
+        
+        # Add noise to duplicated sequences to avoid exact duplication
+        if len(padded_sequences) < batch_size:
+            noise = torch.randn_like(timestamps_tensor) * 0.01
+            timestamps_tensor = timestamps_tensor + noise
+        
+        return timestamps_tensor
+    
+    def _create_sequential_timestamps(self, timestamps_norm, batch_size, seq_len):
+        """Create timestamps from sequential transactions (when company grouping isn't available)"""
+        # Sort timestamps chronologically
+        ts_array = timestamps_norm.to_numpy().astype(np.float32)
+        sorted_ts = np.sort(ts_array)
+        
+        # Calculate how many complete sequences we can make
+        num_complete_seqs = max(1, len(sorted_ts) // seq_len)
+        
+        # Initialize timestamps tensor
+        timestamps_tensor = torch.zeros((batch_size, seq_len), dtype=torch.float32)
+        
+        # Fill available complete sequences
+        for i in range(min(batch_size, num_complete_seqs)):
+            start_idx = i * seq_len
+            if start_idx + seq_len <= len(sorted_ts):
+                seq_array = sorted_ts[start_idx:start_idx+seq_len]
+                timestamps_tensor[i] = torch.tensor([float(x) for x in seq_array], dtype=torch.float32)
+        
+        # If we need more sequences, duplicate with variations
+        if num_complete_seqs < batch_size:
+            for i in range(num_complete_seqs, batch_size):
+                source_idx = i % num_complete_seqs
+                base_seq = timestamps_tensor[source_idx].clone()
+                
+                # Add small noise to maintain temporal character
+                noise = torch.randn_like(base_seq) * 0.01
+                timestamps_tensor[i] = base_seq + noise
+        
+        return timestamps_tensor
+    
+    def _create_synthetic_timestamps(self, df, batch_size, seq_len):
+        """Create synthetic timestamps that mimic realistic business patterns"""
+        # Check if we can group by company_id
+        if 'company_id' in df.columns:
+            print("Creating company-based synthetic timestamps")
+            company_groups = df.groupby('company_id')
+            companies = list(company_groups.groups.keys())
+            
+            # Initialize tensor
+            timestamps_tensor = torch.zeros((batch_size, seq_len), dtype=torch.float32)
+            
+            # For each batch, use one company's pattern
+            for i in range(batch_size):
+                # Select a company (cycling if needed)
+                company_idx = i % len(companies)
+                
+                # Create realistic business day pattern
+                base_time = i * 24 * 3600  # Different day for each company
+                business_start = 9 * 3600  # 9 AM
+                
+                # First timestamp at random time during business hours
+                temp_array = []
+                start_time = base_time + business_start + np.random.random() * 8 * 3600
+                last_time = start_time
+                temp_array.append(float(last_time))
+                
+                # Create subsequent timestamps with realistic patterns
+                for j in range(1, seq_len):
+                    # Time between transactions varies by hour of day
+                    hour_of_day = (last_time / 3600) % 24
+                    
+                    if 9 <= hour_of_day < 17:  # Business hours
+                        time_gap = np.random.exponential(1800)  # ~30 min
+                    elif 17 <= hour_of_day < 20:  # Evening
+                        time_gap = np.random.exponential(7200)  # ~2 hours
+                    else:  # Overnight - skip to next business day
+                        time_gap = (24 - hour_of_day + 9 + np.random.random()) * 3600
+                    
+                    last_time += time_gap
+                    temp_array.append(float(last_time))
+                
+                # Normalize to avoid large values
+                min_val = min(temp_array)
+                normalized = [t - min_val for t in temp_array]
+                
+                timestamps_tensor[i] = torch.tensor(normalized, dtype=torch.float32)
+        else:
+            print("Creating generic synthetic timestamps")
+            # Generic approach - create consistent patterns
+            timestamps_tensor = torch.zeros((batch_size, seq_len), dtype=torch.float32)
+            
+            for i in range(batch_size):
+                base_time = i * 24 * 3600  # Different day for each sequence
+                
+                # Create timestamps with realistic daily pattern
+                temp_array = []
+                for j in range(seq_len):
+                    # Distribute throughout the day with some randomness
+                    hour = 8 + (j * 2) % 10  # Hours between 8am-6pm
+                    minute = np.random.randint(0, 60)
+                    second = np.random.randint(0, 60)
+                    
+                    # Day offset increases every 5 transactions
+                    day_offset = j // 5
+                    
+                    # Calculate timestamp
+                    timestamp = base_time + day_offset * 86400 + hour * 3600 + minute * 60 + second
+                    temp_array.append(float(timestamp))
+                
+                # Normalize
+                min_val = min(temp_array)
+                normalized = [t - min_val for t in temp_array]
+                
+                timestamps_tensor[i] = torch.tensor(normalized, dtype=torch.float32)
+        
+        return timestamps_tensor
+    
+    def _create_company_features(self, df, batch_size):
+        """Helper method to extract company-level features if available"""
+        company_features = None
+        
+        # Check if company-specific columns exist
+        company_columns = [
+            'company_type', 'company_size', 'industry_name', 
+            'company_age', 'num_employees', 'annual_revenue'
+        ]
+        
+        available_columns = [col for col in company_columns if col in df.columns]
+        
+        if available_columns:
+            print(f"Creating company features from {len(available_columns)} columns")
+            company_feats = []
+            
+            for col in available_columns:
+                if col in ['company_type', 'company_size', 'industry_name']:
+                    # Categorical columns - one-hot encode
+                    try:
+                        # Only use categories that appear frequently
+                        value_counts = df[col].value_counts()
+                        frequent_cats = value_counts[value_counts >= 3].index.tolist()
+                        
+                        if frequent_cats:
+                            filtered_col = df[col].copy()
+                            filtered_col[~filtered_col.isin(frequent_cats)] = 'other'
+                            dummies = pd.get_dummies(filtered_col)
+                            company_feats.append(dummies.values)
+                    except Exception as e:
+                        print(f"Error processing company column {col}: {e}")
+                else:
+                    # Numeric columns - normalize
+                    try:
+                        values = df[col].values.astype(float)
+                        normalized = (values - np.mean(values)) / (np.std(values) + 1e-8)
+                        company_feats.append(normalized.reshape(-1, 1))
+                    except Exception as e:
+                        print(f"Error processing numeric company column {col}: {e}")
+            
+            if company_feats:
+                # Combine all features
+                company_feat_matrix = np.hstack(company_feats) if len(company_feats) > 1 else company_feats[0]
+                
+                # Limit to batch size
+                batch_company_features = company_feat_matrix[:batch_size]
+                
+                # Convert to tensor
+                company_features = torch.tensor(batch_company_features, dtype=torch.float)
+        
+        return company_features
     
     def extract_embeddings(self, data):
         """
@@ -1396,13 +1512,32 @@ class EnhancedHybridTransactionModel(nn.Module):
         with torch.no_grad():
             # Extract embeddings from graph model
             if hasattr(self.graph_model, 'extract_embeddings'):
+                # Check if we need to project the features to match expected dimensions
+                input_dim = data['x'].shape[1]
+                hidden_dim = self.hidden_dim
+                
+                print(f"Preparing to extract embeddings - input shape: {data['x'].shape}")
+                
+                # Create a projection if needed to match dimensions with the model
+                if not hasattr(self, '_extraction_projection') or self._extraction_projection.in_features != input_dim:
+                    print(f"Creating projection from {input_dim} to {hidden_dim} dimensions")
+                    self._extraction_projection = nn.Linear(input_dim, hidden_dim).to(data['x'].device)
+                
+                # Project the input features to match model's expected dimensions
+                projected_x = self._extraction_projection(data['x'])
+                print(f"Projected features shape: {projected_x.shape}")
+                
+                # Extract embeddings using the projected features
                 embeddings = self.graph_model.extract_embeddings(
-                    x=data['x'],
+                    x=projected_x,
                     edge_index=data['edge_index'],
                     edge_type=data['edge_type'],
                     edge_attr=data['edge_attr']
                 )
+                
+                print(f"Successfully extracted embeddings with shape: {embeddings.shape}")
                 return embeddings
             else:
                 # Fallback for models without explicit embedding extraction
+                print("Graph model does not support embedding extraction")
                 return None

@@ -343,15 +343,18 @@ def prepare_model_inputs(batch_df, model, device):
     if 'category_id' not in batch_df.columns:
         raise ValueError("Required column 'category_id' not found in batch DataFrame")
     
+    # Get actual batch size from seq_features
+    seq_batch_size = data['seq_features'].size(0)
+    
     # Prepare labels dictionary
     labels = {}
     
     # Handle category_id
-    category_values = batch_df['category_id'].values
+    category_values = batch_df['category_id'].values[:seq_batch_size]  # Truncate to match model batch size
     
     # Convert to numeric if needed
     if pd.api.types.is_object_dtype(category_values):
-        category_codes, _ = pd.factorize(batch_df['category_id'])
+        category_codes, _ = pd.factorize(category_values)
         category_values = category_codes
     
     category_tensor = torch.tensor(
@@ -363,10 +366,10 @@ def prepare_model_inputs(batch_df, model, device):
     
     # Add tax_account_type if available
     if 'tax_account_type' in batch_df.columns:
-        tax_type_values = batch_df['tax_account_type'].values
+        tax_type_values = batch_df['tax_account_type'].values[:seq_batch_size]  # Truncate to match model batch size
         
         if pd.api.types.is_object_dtype(tax_type_values):
-            tax_type_codes, _ = pd.factorize(batch_df['tax_account_type'])
+            tax_type_codes, _ = pd.factorize(tax_type_values)
             tax_type_values = tax_type_codes
         
         tax_type_tensor = torch.tensor(

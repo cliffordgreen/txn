@@ -10,6 +10,9 @@ import argparse
 import pandas as pd
 import numpy as np
 import torch
+from torch.nn.parameter import UninitializedParameter
+# Add UninitializedParameter to safe globals for PyTorch 2.6+ compatibility
+torch.serialization.add_safe_globals([UninitializedParameter])
 import pickle
 from datetime import datetime
 from pathlib import Path

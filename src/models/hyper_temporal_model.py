@@ -614,6 +614,9 @@ class DynamicContextualTemporal(nn.Module):
         batch_size, seq_len, _ = x.shape
         device = x.device
         
+        # Print shapes for debugging
+        print(f"_forward_with_company_grouping - x: {x.shape}, timestamps: {timestamps.shape}, company_ids: {company_ids.shape}")
+        
         # Handle special case when timestamps has shape [batch_size, 1]
         if timestamps.dim() == 2 and timestamps.size(1) == 1:
             print(f"Detected timestamps with shape {timestamps.shape} - expanding to match seq_len {seq_len}")
@@ -621,20 +624,51 @@ class DynamicContextualTemporal(nn.Module):
             expanded_timestamps = timestamps.expand(-1, seq_len)
             timestamps = expanded_timestamps
         
-        # Get unique company IDs
+        # Ensure company_ids has compatible dimensions
+        # If it's 1D, it should match batch_size * seq_len or be expanded
         if company_ids.dim() == 1:
-            # If company_ids is [batch_size], expand to [batch_size, seq_len]
-            company_ids = company_ids.unsqueeze(1).expand(-1, seq_len)
+            if len(company_ids) == batch_size * seq_len:
+                # Already flattened format, no need to reshape
+                print(f"Company IDs already flattened with correct shape: {company_ids.shape}")
+                flat_company_ids = company_ids
+            elif len(company_ids) == batch_size:
+                # Need to expand to match sequence dimension
+                print(f"Expanding company_ids from {company_ids.shape} to match sequence dimension")
+                company_ids = company_ids.unsqueeze(1).expand(-1, seq_len)
+                flat_company_ids = company_ids.reshape(-1)  # [batch_size * seq_len]
+            else:
+                # Mismatch in dimensions - handle gracefully
+                print(f"WARNING: company_ids shape {company_ids.shape} doesn't match x shape {x.shape}. Using default grouping.")
+                # Create sequential IDs as fallback
+                flat_company_ids = torch.arange(batch_size).repeat_interleave(seq_len)
+        else:
+            # Already 2D, just flatten
+            flat_company_ids = company_ids.reshape(-1)  # [batch_size * seq_len]
         
         # Flatten for easier processing
         flat_x = x.reshape(-1, x.size(-1))  # [batch_size * seq_len, hidden_dim]
         # Handle 2D timestamps - need to flatten to 1D 
         flat_timestamps = timestamps.reshape(-1)  # [batch_size * seq_len]
-        flat_company_ids = company_ids.reshape(-1)  # [batch_size * seq_len]
+        
+        # Verify dimensions match
+        print(f"Flattened dimensions - flat_x: {flat_x.shape}, flat_timestamps: {flat_timestamps.shape}, flat_company_ids: {flat_company_ids.shape}")
+        
+        # Safety check - ensure all tensors have compatible first dimensions
+        min_len = min(len(flat_x), len(flat_timestamps), len(flat_company_ids))
+        if min_len < len(flat_x):
+            print(f"WARNING: Truncating flat_x from {len(flat_x)} to {min_len}")
+            flat_x = flat_x[:min_len]
+        if min_len < len(flat_timestamps):
+            print(f"WARNING: Truncating flat_timestamps from {len(flat_timestamps)} to {min_len}")
+            flat_timestamps = flat_timestamps[:min_len]
+        if min_len < len(flat_company_ids):
+            print(f"WARNING: Truncating flat_company_ids from {len(flat_company_ids)} to {min_len}")
+            flat_company_ids = flat_company_ids[:min_len]
         
         # Get unique companies
         unique_companies = torch.unique(flat_company_ids)
         num_companies = len(unique_companies)
+        print(f"Found {num_companies} unique companies")
         
         # Pre-allocate output tensor
         flat_output = torch.zeros_like(flat_x)

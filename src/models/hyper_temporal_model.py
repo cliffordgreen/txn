@@ -232,6 +232,9 @@ class MultiModalFusion(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         
+        # Initialize pre_norm for all features (4 modalities concatenated)
+        self.pre_norm = nn.LayerNorm(hidden_dim * 4)
+        
         # Cross-attention for graph-to-sequence
         self.graph_to_seq_attention = nn.MultiheadAttention(
             embed_dim=hidden_dim,
@@ -412,8 +415,6 @@ class MultiModalFusion(nn.Module):
         all_features = torch.clamp(all_features, min=-10.0, max=10.0)
         
         # Apply layer normalization for additional stability
-        if not hasattr(self, 'pre_norm'):
-            self.pre_norm = nn.LayerNorm(all_features.size(-1)).to(all_features.device)
         all_features = self.pre_norm(all_features)
         
         # Apply output projection with gradient clipping during training
@@ -1118,12 +1119,17 @@ class HyperTemporalTransactionModel(nn.Module):
             nn.Linear(hidden_dim * 2, hidden_dim)
         )
         
+        # Initialize normalization layers that were previously created dynamically
+        self.pooled_norm = nn.LayerNorm(hidden_dim)
+        self.pre_norm = nn.LayerNorm(hidden_dim)
+        
         # Primary output for category prediction
         self.output_category = nn.Linear(hidden_dim, output_dim)
         
         # Secondary output for tax account type prediction (if using multi-task learning)
         if self.multi_task:
             self.output_tax_type = nn.Linear(hidden_dim, self.tax_type_output_dim)
+            self.tax_norm = nn.LayerNorm(hidden_dim)
             
             # Shared task representation
             self.task_attention = nn.Sequential(
@@ -1550,8 +1556,6 @@ class HyperTemporalTransactionModel(nn.Module):
         h_pooled = torch.clamp(h_pooled, min=-10.0, max=10.0)
         
         # Apply layer normalization for enhanced stability
-        if not hasattr(self, 'pooled_norm'):
-            self.pooled_norm = nn.LayerNorm(h_pooled.size(-1)).to(h_pooled.device)
         h_pooled_norm = self.pooled_norm(h_pooled)
         
         # Apply pre-output layer with gradient control during training
@@ -1568,8 +1572,6 @@ class HyperTemporalTransactionModel(nn.Module):
         h_pre = torch.clamp(h_pre, min=-5.0, max=5.0)  # Use more conservative bounds
         
         # Apply second layer normalization before final projection
-        if not hasattr(self, 'pre_norm'):
-            self.pre_norm = nn.LayerNorm(h_pre.size(-1)).to(h_pre.device)
         h_pre_norm = self.pre_norm(h_pre)
         
         # Apply output layer with gradient control
@@ -1607,8 +1609,6 @@ class HyperTemporalTransactionModel(nn.Module):
             tax_type_weighted = h_pre_norm * task_weights[:, 1:2]
             
             # Apply layer normalization for tax type task
-            if not hasattr(self, 'tax_norm'):
-                self.tax_norm = nn.LayerNorm(tax_type_weighted.size(-1)).to(tax_type_weighted.device)
             tax_type_weighted = self.tax_norm(tax_type_weighted)
             
             # Generate tax type logits with stability measures 
@@ -1628,6 +1628,160 @@ class HyperTemporalTransactionModel(nn.Module):
         else:
             # Return only category prediction
             return category_logits
+            
+    def extract_embeddings(self, data):
+        """
+        Extract embeddings from the hyper-temporal model for feature analysis
+        
+        Args:
+            data: Dictionary with prepared data including:
+                 - graph_features: Graph features
+                 - seq_features: Sequence features
+                 - tabular_features: Tabular features
+                 - timestamps: Timestamps
+                 - company_features: (Optional) Company features
+                 
+        Returns:
+            Embeddings tensor [batch_size, hidden_dim]
+        """
+        self.eval()
+        with torch.no_grad():
+            # Get batch size and other dimensions from the data
+            graph_features = data.get('graph_features', None)
+            seq_features = data.get('seq_features', None)
+            tabular_features = data.get('tabular_features', None)
+            timestamps = data.get('timestamps', None)
+            company_features = data.get('company_features', None)
+            descriptions = data.get('descriptions', None)
+            
+            if graph_features is None or seq_features is None or tabular_features is None or timestamps is None:
+                raise ValueError("Missing required input features for embedding extraction")
+                
+            batch_size = seq_features.shape[0]
+            device = seq_features.device
+            
+            # Handle any dimension mismatches
+            if graph_features.dim() == 2:
+                graph_features = graph_features.unsqueeze(1)
+                
+            if tabular_features.dim() == 2:
+                tabular_features = tabular_features.unsqueeze(1)
+            
+            # Process features through initial projections
+            if graph_features.dim() == 3:
+                graph_h = self.graph_projection(graph_features.reshape(-1, graph_features.size(2)))
+                graph_h = graph_h.reshape(batch_size, graph_features.size(1), self.hidden_dim)
+            else:
+                graph_h = self.graph_projection(graph_features)
+                graph_h = graph_h.unsqueeze(1) if graph_h.dim() == 2 else graph_h
+                
+            seq_h = self.sequence_projection(seq_features.reshape(-1, seq_features.size(-1)))
+            seq_h = seq_h.reshape(batch_size, seq_features.size(1), self.hidden_dim)
+            
+            if tabular_features.dim() == 3:
+                tabular_h = self.tabular_projection(tabular_features.reshape(-1, tabular_features.size(2)))
+                tabular_h = tabular_h.reshape(batch_size, tabular_features.size(1), self.hidden_dim)
+            else:
+                tabular_h = self.tabular_projection(tabular_features)
+                tabular_h = tabular_h.unsqueeze(1) if tabular_h.dim() == 2 else tabular_h
+                
+            # Process company features if provided
+            company_h = None
+            if company_features is not None:
+                if company_features.dim() == 3:
+                    company_h = self.company_projection(company_features.reshape(-1, company_features.size(2)))
+                    company_h = company_h.reshape(batch_size, company_features.size(1), self.hidden_dim)
+                else:
+                    company_h = self.company_projection(company_features)
+                    company_h = company_h.unsqueeze(1) if company_h.dim() == 2 else company_h
+            
+            # Process text features if available
+            text_features = None
+            if self.use_text_processor and descriptions is not None:
+                try:
+                    # Extract text features (similar to forward method)
+                    if isinstance(self.text_processor, nn.Module) and hasattr(self.text_processor, 'forward'):
+                        numerical_features = tabular_features.view(batch_size, -1) if tabular_features.dim() > 2 else tabular_features
+                        text_embeddings = self.text_processor(descriptions, numerical_features)
+                    else:
+                        text_embeddings = self.text_processor.process_batch(descriptions)
+                        
+                    # Project text embeddings
+                    text_features = self.text_projection(text_embeddings)
+                    text_features = self.text_enhancer(text_features)
+                except Exception as e:
+                    print(f"Warning: Error processing text features: {e}")
+                    text_features = torch.zeros(batch_size, self.hidden_dim, device=device)
+            
+            # Adapt graph_h to ensure its first dimension matches batch_size
+            if graph_h.size(0) != batch_size:
+                graph_h_adapted = graph_h[:batch_size]
+            else:
+                graph_h_adapted = graph_h
+                
+            # Ensure proper dimensions for fusion module
+            if graph_h_adapted.dim() == 3 and graph_h_adapted.size(1) == 1:
+                graph_h_adapted = graph_h_adapted.squeeze(1)
+            
+            # Apply fusion module to get multi-modal representation
+            fused_features = torch.zeros(batch_size, seq_features.size(1), self.hidden_dim, device=device)
+            for i in range(seq_features.size(1)):
+                # Extract tabular features correctly based on their shape
+                if tabular_h.size(1) == 1:  # Single tabular feature per batch
+                    tab_feature = tabular_h.squeeze(1)
+                elif tabular_h.size(1) == seq_features.size(1):  # Sequence of tabular features
+                    tab_feature = tabular_h[:, i]
+                else:  # Fall back to using the mean
+                    tab_feature = tabular_h.mean(dim=1)
+                    
+                # Extract company features if available
+                company_feat = None
+                if company_h is not None:
+                    if company_h.size(1) == 1:  # Single company feature per batch
+                        company_feat = company_h.squeeze(1)
+                    elif company_h.size(1) == seq_features.size(1):  # Sequence of company features
+                        company_feat = company_h[:, i]
+                    else:  # Fall back to using the mean
+                        company_feat = company_h.mean(dim=1)
+                
+                fused_features[:, i] = self.fusion_module(
+                    graph_h_adapted if graph_h_adapted.dim() == 2 else graph_h_adapted.mean(dim=1),
+                    seq_h[:, i],
+                    tab_feature,
+                    company_feat
+                )
+            
+            # Apply company-aware context layer if company features are available
+            if company_h is not None:
+                fused_features = self.company_context_layer(
+                    fused_features,
+                    company_h.mean(dim=1, keepdim=True) if company_h.dim() > 2 and company_h.size(1) > 1 else company_h
+                )
+            
+            # Global pooling (mean over sequence dimension)
+            h_pooled = torch.mean(fused_features, dim=1)
+            
+            # Add text features contribution if available
+            if text_features is not None:
+                h_pooled = h_pooled + 0.2 * text_features
+                
+            # Add company features contribution if available
+            if company_h is not None:
+                company_repr = company_h.mean(dim=1) if company_h.dim() > 2 else company_h.squeeze(1)
+                h_pooled = h_pooled + 0.25 * company_repr
+            
+            # Apply normalization for stability
+            h_pooled = torch.nan_to_num(h_pooled, nan=0.0, posinf=1.0, neginf=-1.0)
+            h_pooled = torch.clamp(h_pooled, min=-10.0, max=10.0)
+            h_pooled = self.pooled_norm(h_pooled)
+            
+            # Apply pre-output layer to get final embeddings
+            h_pre = self.pre_output(h_pooled)
+            h_pre = torch.nan_to_num(h_pre, nan=0.0, posinf=1.0, neginf=-1.0)
+            h_pre = torch.clamp(h_pre, min=-5.0, max=5.0)
+            h_pre = self.pre_norm(h_pre)
+            
+            return h_pre
 
 
 class HyperTemporalEnsemble(nn.Module):
@@ -1813,3 +1967,70 @@ class HyperTemporalEnsemble(nn.Module):
         ensemble_logits = weighted_logits + meta_logits
         
         return ensemble_logits
+        
+    def extract_embeddings(self, data):
+        """
+        Extract embeddings from the hyper-temporal ensemble model for feature analysis
+        
+        Args:
+            data: Dictionary with prepared data including:
+                 - graph_features: Graph features
+                 - seq_features: Sequence features
+                 - tabular_features: Tabular features
+                 - timestamps: Timestamps
+                 - company_features: (Optional) Company features
+                 
+        Returns:
+            Embeddings tensor [batch_size, hidden_dim]
+        """
+        self.eval()
+        with torch.no_grad():
+            # Extract embeddings from each model in the ensemble
+            all_embeddings = []
+            for model in self.models:
+                if hasattr(model, 'extract_embeddings') and callable(model.extract_embeddings):
+                    try:
+                        # Get embeddings from this model
+                        model_embeddings = model.extract_embeddings(data)
+                        all_embeddings.append(model_embeddings)
+                    except Exception as e:
+                        print(f"Warning: Failed to extract embeddings from ensemble model: {e}")
+                        continue
+            
+            if not all_embeddings:
+                raise ValueError("Failed to extract embeddings from any model in the ensemble")
+            
+            # Get batch size from the data
+            batch_size = data['seq_features'].shape[0]
+            device = data['seq_features'].device
+            
+            # Combine embeddings using ensemble weights
+            context_features = torch.mean(data['seq_features'], dim=1)
+            expert_weights = self.expert_attention(context_features)  # [batch_size, num_models]
+            
+            # If company features are available, use them to adjust weights
+            if 'company_features' in data and data['company_features'] is not None:
+                company_features = data['company_features']
+                # Get company-based expert weights
+                if company_features.dim() > 2:
+                    # Take mean across sequence dimension if it exists
+                    company_feat = company_features.mean(dim=1)
+                else:
+                    company_feat = company_features
+                    
+                company_expert_weights = self.company_expert_selector(company_feat)
+                
+                # Combine sequence-based and company-based expert weights
+                expert_weights = 0.7 * expert_weights + 0.3 * company_expert_weights
+            
+            # Weighted average of embeddings
+            combined_embeddings = torch.zeros_like(all_embeddings[0])
+            for i, embeddings in enumerate(all_embeddings):
+                if i < expert_weights.size(1):
+                    combined_embeddings += expert_weights[:, i:i+1] * embeddings
+            
+            # Ensure embeddings are numerically stable
+            combined_embeddings = torch.nan_to_num(combined_embeddings, nan=0.0, posinf=1.0, neginf=-1.0)
+            combined_embeddings = torch.clamp(combined_embeddings, min=-10.0, max=10.0)
+            
+            return combined_embeddings

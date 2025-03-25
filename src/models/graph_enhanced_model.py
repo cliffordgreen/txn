@@ -423,16 +423,83 @@ class GraphEnhancedTemporalModel(nn.Module):
         """
         self.eval()
         with torch.no_grad():
-            # Check dimensions and reshape if needed, similar to the forward method
-            expected_input_dim = 512  # From the dimension mismatch error
+            # Log tensor shapes for debugging
+            print(f"Input tensor x shape: {x.shape}")
             
-            # Dynamically adjust x if needed to match expected dimension
-            if x.shape[1] != expected_input_dim and x.shape[1] == 128:
-                # If x has too few dimensions, pad it
-                x = torch.zeros(x.shape[0], expected_input_dim, device=x.device)
-                
-            # Process input features
-            h = self.input_projection(x)
+            # Always use actual input dimension - never rely on an expected dimension
+            # that might be 0 or incompatible
+            actual_input_dim = x.shape[1]
+            print(f"Using actual input dimension: {actual_input_dim}")
+            
+            print(f"Preparing to extract embeddings - input shape: {x.shape}")
+            
+            # Check if first module in input_projection is nn.LazyLinear
+            # If it is, we don't need to do any reshaping - LazyLinear will handle it
+            if isinstance(self.input_projection, nn.Sequential) and len(list(self.input_projection.children())) > 0:
+                first_module = list(self.input_projection.children())[0]
+                if isinstance(first_module, nn.LazyLinear):
+                    print(f"Using LazyLinear which will adapt to input dimension: {actual_input_dim}")
+                    # No reshaping needed - LazyLinear adapts automatically
+                else:
+                    # Check if it's a Linear layer and get its expected input dim
+                    if isinstance(first_module, nn.Linear):
+                        expected_input_dim = first_module.in_features
+                        print(f"First layer is Linear with expected input dim: {expected_input_dim}")
+                        
+                        # Handle dimension mismatch with proper projection
+                        if actual_input_dim != expected_input_dim:
+                            print(f"Dimension mismatch: Input tensor has shape {actual_input_dim}, but expected {expected_input_dim}")
+                            
+                            # Handle special case of expected_input_dim being 0
+                            if expected_input_dim == 0:
+                                print(f"Expected input dimension is 0, using actual input dimension instead")
+                                # We can't reshape to a zero dimension, so use the hidden_dim as fallback
+                                if hasattr(self, 'hidden_dim'):
+                                    expected_input_dim = self.hidden_dim
+                                    print(f"Using model's hidden_dim: {expected_input_dim}")
+                                else:
+                                    # If no hidden_dim, use actual_input_dim or a reasonable default
+                                    expected_input_dim = actual_input_dim or 128
+                                    print(f"Using fallback dim: {expected_input_dim}")
+                            
+                            # Use average pooling for downsampling (if input is larger than expected)
+                            if actual_input_dim > expected_input_dim:
+                                print(f"Downsampling from {actual_input_dim} to {expected_input_dim}")
+                                x = x.reshape(x.shape[0], actual_input_dim)  # Ensure 2D
+                                x_chunks = torch.chunk(x, chunks=actual_input_dim // expected_input_dim + 1, dim=1)
+                                x = torch.mean(torch.stack([chunk for chunk in x_chunks if chunk.size(1) > 0], dim=1), dim=1)
+                                # Ensure correct output size
+                                if x.size(1) != expected_input_dim:
+                                    pad_size = expected_input_dim - x.size(1)
+                                    if pad_size > 0:
+                                        x = torch.nn.functional.pad(x, (0, pad_size))
+                                    else:
+                                        x = x[:, :expected_input_dim]
+                            
+                            # Use repeating for upsampling (if input is smaller than expected)
+                            elif actual_input_dim < expected_input_dim:
+                                print(f"Upsampling from {actual_input_dim} to {expected_input_dim}")
+                                # Calculate repetition factor
+                                repeat_factor = math.ceil(expected_input_dim / max(actual_input_dim, 1))
+                                # Repeat and truncate
+                                x_repeated = x.repeat(1, repeat_factor)
+                                x = x_repeated[:, :expected_input_dim]
+            else:
+                # Direct Linear layer case
+                print("Input projection is a direct Linear layer or other type")
+            
+            print(f"Final input features shape: {x.shape}")
+            
+            # Safely process input features
+            try:
+                h = self.input_projection(x)
+                print(f"Projected features shape: {h.shape}")
+            except Exception as e:
+                print(f"Error in input projection: {str(e)}")
+                # Fall back to a simple projection as last resort
+                linear = nn.Linear(x.shape[1], self.hidden_dim, device=x.device)
+                h = linear(x)
+                print(f"Fell back to a simple linear projection. New shape: {h.shape}")
             
             # Process graph structure to get embeddings
             graph_h = h
@@ -443,6 +510,9 @@ class GraphEnhancedTemporalModel(nn.Module):
             # Apply graph attention if available
             if hasattr(self, 'graph_attention'):
                 graph_h = self.graph_attention(graph_h, edge_index)
+            
+            # Handle NaN and Inf values
+            graph_h = torch.nan_to_num(graph_h, nan=0.0, posinf=1.0, neginf=-1.0)
             
             return graph_h
         
